@@ -11,7 +11,7 @@ bash chaosplus.sh -di crproxy --domain ${CRPROXY}
 
 ```
 
-## Install K&S
+## Install K8S
 
 ```bash
 
