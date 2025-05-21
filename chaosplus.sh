@@ -520,8 +520,7 @@ INFO "ENV HAS_GOOGLE: ${HAS_GOOGLE}"
 
 GHPROXY=${GHPROXY:-https://ghfast.top/}
 INFO "ENV GHPROXY: ${GHPROXY}"
-# CRPROXY=${CRPROXY:-kubesre.xyz}
-CRPROXY=${CRPROXY:-noproxy.top}
+CRPROXY=${CRPROXY:-kubesre.xyz}
 INFO "ENV CRPROXY: ${CRPROXY}"
 
 # https://github.com/labring-actions/cluster-image-docs/blob/main/docs/aliyun-shanghai/rootfs.md
@@ -1245,7 +1244,6 @@ system_uninstall_cri() {
 # setter
 #
 ###################################################################################################
-
 set_cr_mirrors_host() {
     if ! command -v containerd &>/dev/null; then
         echo "ERROR: containerd command not found" >&2
@@ -1258,12 +1256,14 @@ set_cr_mirrors_host() {
     local config_path="/etc/containerd/certs.d"
     mkdir -p "$config_path"
 
-    # 从参数获取 mirror 列表（逗号分隔）
+    # 读取参数
     local mirror_list="$(getarg mirrors "$@")"
-    mirror_list="${mirror_list:-$CRPROXY}" # 允许为空
+    mirror_list="${mirror_list:-$CRPROXY}"
     IFS=',' read -ra crmirrors <<<"$mirror_list"
 
-    # registry 列表（前缀不能动）
+    local scheme="$(getarg scheme "$@")"
+    scheme="${scheme:-https}"
+
     local registries=(
         "cr.l5d.io" "l5d"
         "docker.elastic.co" "elastic"
@@ -1283,15 +1283,16 @@ set_cr_mirrors_host() {
         local registry="$1"
         shift
         local prefixes=("$@")
-
-        # 如果没有镜像就退出
         [ "${#crmirrors[@]}" -eq 0 ] && return 1
 
-        printf 'server = "https://%s"\n' "$registry"
+        printf 'server = "%s://%s"\n' "$scheme" "$registry"
         for mirror in "${crmirrors[@]}"; do
             for prefix in "${prefixes[@]}"; do
-                printf '[host."https://%s.%s"]\n' "$prefix" "$mirror"
+                printf '[host."%s://%s.%s"]\n' "$scheme" "$prefix" "$mirror"
                 printf '  capabilities = ["pull", "resolve"]\n'
+                if [ "$scheme" = "http" ]; then
+                    printf '  skip_verify = true\n'
+                fi
             done
         done
     }
@@ -1323,6 +1324,9 @@ set_cr_mirrors_registries() {
     local mirror_list="${mirror_list:-${CRPROXY}}"
     IFS=',' read -ra mirrors <<<"$mirror_list"
 
+    local scheme=$(getarg scheme "$@")
+    local scheme="${scheme:-https}"
+
     local registries_file=$(getarg registries "$@")
     if [ -d "/etc/rancher/k3s" ]; then
         registries_file="${registries_file:-/etc/rancher/k3s/registries.yaml}"
@@ -1335,9 +1339,9 @@ set_cr_mirrors_registries() {
         return 1
     fi
 
+    echo "$registries_file"
     mkdir -p "$(dirname "$registries_file")"
     rm -f "$registries_file"
-    echo "$registries_file"
 
     # 定义 registry => 前缀 映射表
     local -A registry_prefixes=(
@@ -1357,6 +1361,9 @@ set_cr_mirrors_registries() {
 
     echo "mirrors:" >>"$registries_file"
 
+    # 用于收集 registry host 以生成 configs
+    declare -A insecure_hosts=()
+
     for registry in "${!registry_prefixes[@]}"; do
         local prefix="${registry_prefixes[$registry]}"
         if [ "${#mirrors[@]}" -eq 0 ]; then
@@ -1366,14 +1373,17 @@ set_cr_mirrors_registries() {
         echo "  $registry:" >>"$registries_file"
         echo "    endpoint:" >>"$registries_file"
         for mirror in "${mirrors[@]}"; do
-            if [[ "$registry" == "quay.io" || "$registry" == "registry.jujucharms.com" ]]; then
-                echo "      - quay://${prefix}.${mirror}" >>"$registries_file"
-            else
-                echo "      - https://${prefix}.${mirror}" >>"$registries_file"
+            local endpoint="${scheme}://${prefix}.${mirror}"
+            echo "      - ${endpoint}" >>"$registries_file"
+
+            # 如果使用 http，添加到 insecure host 列表
+            if [ "$scheme" = "http" ]; then
+                insecure_hosts["${prefix}.${mirror}"]=1
             fi
         done
     done
 
+    # 添加 sealos hub
     cat <<EOF >>"$registries_file"
   sealos.hub:5000:
     endpoint:
@@ -1383,7 +1393,18 @@ configs:
     auth:
       username: admin
       password: passw0rd
+    tls:
+      insecure_skip_verify: true
 EOF
+
+    # 添加其他 insecure hosts
+    for host in "${!insecure_hosts[@]}"; do
+        cat <<EOF >>"$registries_file"
+  ${host}:
+    tls:
+      insecure_skip_verify: true
+EOF
+    done
 
     cat "$registries_file"
 }
@@ -1436,6 +1457,9 @@ set_docker_mirrors() {
     local mirror_list=$(getarg mirrors "$@")
     local mirror_list="${mirror_list:-$CRPROXY}"
     IFS=',' read -ra mirror_hosts <<<"$mirror_list"
+
+    local scheme=$(getarg scheme "$@")
+    local scheme="${scheme:-http}"
 
     local docker_config_path="/etc/docker/daemon.json"
     sudo mkdir -p /etc/docker
@@ -1500,12 +1524,7 @@ set_docker_mirrors() {
                 local host="${mirror_hosts[$j]}"
                 local comma=","
                 [[ $j -eq $((${#mirror_hosts[@]} - 1)) ]] && comma=""
-
-                if [[ "$reg" == "quay.io" || "$reg" == "registry.jujucharms.com" ]]; then
-                    echo "        \"quay://${prefix}.${host}\"$comma"
-                else
-                    echo "        \"https://${prefix}.${host}\"$comma"
-                fi
+                echo "        \"${scheme}://${prefix}.${host}\"$comma"
             done
             echo "      ]"
             echo -n "    }"
@@ -1778,7 +1797,7 @@ system_install_k8s_config() {
     elif [ -f "/etc/kubernetes/admin.conf" ]; then
         export KUBECONFIG=/etc/kubernetes/admin.conf
     fi
-    INFO "KUBECONFIG: $KUBECONFIG"
+    INFO "export KUBECONFIG=$KUBECONFIG"
 }
 
 system_uninstall_sealos() {
@@ -2145,12 +2164,14 @@ k8s_install_higress() {
     local type=$(getarg type $@)
     local istio=$(getarg istio $@)
     local gateway=$(getarg gateway $@)
+    local ingress_class=$(getarg ingress_class $@)
+    # local ingress_class=${ingress_class:-higress}
 
-    echo "local=${local:-false}"
-    echo "host=${host:-false}"
-    echo "type=${type:-LoadBalancer}"
-    echo "istio=${istio:-false}"
-    echo "gateway=${gateway:-false}"
+    echo "local=${local}"
+    echo "host=${host}"
+    echo "type=${type}"
+    echo "istio=${istio}"
+    echo "gateway=${gateway}"
 
     local VERSION=$(get_github_release_version "alibaba/higress")
     echo "latest hgctl version: $VERSION"
@@ -2171,22 +2192,27 @@ k8s_install_higress() {
             --create-namespace \
             --render-subchart-notes \
             --set global.local=${local:-false} \
-            --set global.ingressClass=higress \
-            --set global.enableIstioAPI=${istio:-false} \
-            --set global.enableGatewayAPI=${gateway:-false} \
+            --set global.ingressClass="${ingress_class}" \
+            --set global.enableIstioAPI=${istio:-true} \
+            --set global.enableGatewayAPI=${gateway:-true} \
             --set higress-core.gateway.replicas=1 \
+            --set higress-core.gateway.kind=DaemonSet \
             --set higress-core.gateway.hostNetwork=${host:-false} \
             --set higress-core.gateway.service.type=${type:-LoadBalancer} \
             --set higress-core.gateway.resources.requests.cpu=256m \
             --set higress-core.gateway.resources.requests.memory=128Mi \
             --set higress-core.gateway.resources.limits.cpu=256m \
             --set higress-core.gateway.resources.limits.memory=128Mi \
+            --set higress-core.gateway.tolerations[0].key=node-role.kubernetes.io/control-plane \
+            --set higress-core.gateway.tolerations[0].operator=Exists \
+            --set higress-core.gateway.tolerations[0].effect=NoSchedule \
             --set higress-core.controller.replicas=1 \
             --set higress-core.controller.service.type=ClusterIP \
             --set higress-core.controller.resources.requests.cpu=256m \
             --set higress-core.controller.resources.requests.memory=128Mi \
             --set higress-core.controller.resources.limits.cpu=256m \
             --set higress-core.controller.resources.limits.memory=128Mi \
+            --set "higress-core.controller.nodeSelector.node-role\.kubernetes\.io\/control-plane=" \
             --set higress-core.pilot.replicaCount=1 \
             --set higress-core.pilot.resources.limits.cpu=256m \
             --set higress-core.pilot.resources.limits.memory=128Mi \
@@ -2376,6 +2402,7 @@ metadata:
   name: ${name}${idx}
   namespace: ${namespace:-default}
   annotations:
+    kubernetes.io/ingress.class: ${ingress_class:-higress}
     nginx.ingress.kubernetes.io/auth-type: ${auth_type}
     nginx.ingress.kubernetes.io/auth-secret: ${auth_secret}
     nginx.ingress.kubernetes.io/auth-realm: '${auth_realm:-Authentication Required - ${domain}}'
@@ -2417,6 +2444,9 @@ k8s_install_frps() {
 
     local ingress_class=$(getarg ingress_class $@ 2>/dev/null)
     local ingress_class=${ingress_class:-higress}
+
+    local image=$(getarg image $@ 2>/dev/null)
+    local image=${image:-docker.io/snowdreamtech/frps}
 
     kubectl create namespace $namespace 2>/dev/null || true
 
@@ -2464,7 +2494,8 @@ EOF
     kubectl delete secret ${FRPS_TOML} -n ${namespace} 2>/dev/null || true
     kubectl create secret generic ${FRPS_TOML} -n ${namespace} --from-file=${tmpdir}/${FRPS_TOML}
 
-    local VERSION=$(get_github_release_version "fatedier/frp")
+    # local VERSION=$(get_github_release_version "fatedier/frp")
+
     cat <<EOF >${tmpdir}/${FRPS_YAML}
 apiVersion: apps/v1
 kind: Deployment
@@ -2485,7 +2516,7 @@ spec:
     spec:
       containers:
         - name: frps
-          image: docker.io/snowdreamtech/frps:${VERSION}
+          image: ${image}
           ports:
             - name: bind
               containerPort: ${port_bind}
