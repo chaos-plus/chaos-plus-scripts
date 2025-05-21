@@ -46,7 +46,29 @@ bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -si k8s_config
 bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -si k8s_cr_mirrors_registries \
 --mirrors ${CRPROXY}
 
-bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki core --cidr <Your_Public_IPS>
+#bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki core --cidr <Your_Public_IPS>
+
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki helm
+
+bash<(curl -Ls ${REPO}/install_docker_traefik.sh) -ki cilium
+# bash chaosplus.sh -ki cilium_cidr
+# --cidr xx.xx.xx.xx
+
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki istio
+
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki cert_manager
+
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki metrics_server
+
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki openebs
+
+// higress 2 好像不支持 gatewayAPI, 使用 Host+NodePort
+bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki higress \
+--gateway false \
+--istio true \
+--host true \
+--type NodePort
+
 
 bash <(curl -Ls ${REPO}/install_docker_traefik.sh) -ki frps \
 --bind_route_rule frps.${DOMAIN} \
