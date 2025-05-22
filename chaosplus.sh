@@ -506,7 +506,7 @@ elif echo "$PING_GCR" | grep -q "HTTP/1.1 301 Moved Permanently"; then
 else
     HAS_GCR=""
 fi
-INFO "ENV HAS_GCR: ${HAS_GCR}"
+INFO "ENV HAS_GCR: ${HAS_GCR:-"false"}"
 
 PING_GOOGLE=$(curl -Is http://google.com --silent --connect-timeout 5 --max-time 5 | head -n 1)
 if echo "$PING_GOOGLE" | grep -q "HTTP/1.1 200 OK"; then
@@ -516,7 +516,7 @@ elif echo "$PING_GOOGLE" | grep -q "HTTP/1.1 301 Moved Permanently"; then
 else
     HAS_GOOGLE=""
 fi
-INFO "ENV HAS_GOOGLE: ${HAS_GOOGLE}"
+INFO "ENV HAS_GOOGLE: ${HAS_GOOGLE:-"false"}"
 
 GHPROXY=${GHPROXY:-https://ghfast.top/}
 INFO "ENV GHPROXY: ${GHPROXY}"
@@ -536,11 +536,10 @@ getarg() {
     shift # 去掉第一个参数（即参数名称），剩下的是参数列表
     local __value=""
     local __start=false
-
     for arg in "$@"; do
-        if [[ $arg =~ ^- ]]; then     # 如果是选项参数（以 - 开头）
-            local _aname="${arg//-/}" # 去掉 - 符号
-            if [[ "$_aname" == "$__name" ]]; then
+        if [[ $arg =~ ^- ]]; then   # 如果是选项参数（以 - 开头）
+            local _key="${arg//-/}" # 去掉 - 符号
+            if [[ "$_key" == "$__name" ]]; then
                 __start=true # 开始收集值
             else
                 __start=false # 停止收集值
@@ -551,8 +550,28 @@ getarg() {
             __value="$__value $arg" # 收集值
         fi
     done
-
     echo $__value # 输出收集到的值
+}
+
+hasarg() {
+    local __name=$1
+    shift # 去掉第一个参数（即参数名称），剩下的是参数列表
+    local __value=""
+    local __start=false
+    local __has=false
+    for arg in "$@"; do
+        if [[ $arg =~ ^- ]]; then   # 如果是选项参数（以 - 开头）
+            local _key="${arg//-/}" # 去掉 - 符号
+            if [[ "$_key" == "$__name" ]]; then
+                __start=true # 开始收集值
+                __has=true
+                break
+            else
+                __start=false # 停止收集值
+            fi
+        fi
+    done
+    echo $__has
 }
 
 TOKEN=$(getarg token $@)
@@ -1658,107 +1677,84 @@ system_install_k8s_microk8s() {
     snap install microk8s --classic
 }
 
-system_install_k8s_k3s() {
-    local ips=$(getarg ips $@)
-    local TOKEN=$(getarg token $@)
-    # 将逗号分隔的 IP 地址转换为数组
-    IFS=',' read -r -a IPS <<<"$ips"
-    # 合并两个数组
-    local EXTERNAL_IPS=("${IPS[@]}" "$IPV4_LAN" "$IPV4_WAN")
-    local UNIQUE_IPS=($(echo "${EXTERNAL_IPS[@]}" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' '))
+# system_install_k8s_k3s() {
+#     local ips=$(getarg ips $@)
+#     local TOKEN=$(getarg token $@)
+#     # 将逗号分隔的 IP 地址转换为数组
+#     IFS=',' read -r -a IPS <<<"$ips"
+#     # 合并两个数组
+#     local EXTERNAL_IPS=("${IPS[@]}" "$IPV4_LAN" "$IPV4_WAN")
+#     local UNIQUE_IPS=($(echo "${EXTERNAL_IPS[@]}" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' '))
 
-    # 动态拼接 tls-san 参数
-    local TLS_SANS=""
-    for IP in "${UNIQUE_IPS[@]}"; do
-        if [ -n "$IP" ]; then # 确保IP非空
-            local TLS_SANS="$TLS_SANS --tls-san $IP"
-        fi
-    done
+#     # 动态拼接 tls-san 参数
+#     local TLS_SANS=""
+#     for IP in "${UNIQUE_IPS[@]}"; do
+#         if [ -n "$IP" ]; then # 确保IP非空
+#             local TLS_SANS="$TLS_SANS --tls-san $IP"
+#         fi
+#     done
 
-    if [ -z "${TLS_SANS}" ]; then
-        ERROR "MISSING TLS_SANS" && exit 1
-    else
-        NOTE "TLS_SANS: $TLS_SANS"
-    fi
-    if [ -z "${TOKEN}" ]; then
-        ERROR "MISSING TOKEN" && exit 1
-    fi
+#     if [ -z "${TLS_SANS}" ]; then
+#         ERROR "MISSING TLS_SANS" && exit 1
+#     else
+#         NOTE "TLS_SANS: $TLS_SANS"
+#     fi
+#     if [ -z "${TOKEN}" ]; then
+#         ERROR "MISSING TOKEN" && exit 1
+#     fi
 
-    # --flannel-backend=wireguard-native,none
-    # --node-external-ip $IPV4_LAN  \
-    # TODO HAS_GOOGLE ?
-    curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -s - server \
-        --token $TOKEN --cluster-init \
-        --disable traefik \
-        --disable servicelb \
-        --disable-network-policy \
-        --write-kubeconfig-mode 777 \
-        --kube-proxy-arg "proxy-mode=ipvs" \
-        --kube-proxy-arg "masquerade-all=true" \
-        --kube-proxy-arg "metrics-bind-address=0.0.0.0" \
-        --flannel-backend none \
-        $TLS_SANS
-    if ! command -v kubectl &>/dev/null; then
-        ERROR "install k3s cli failed;" && exit
-    fi
-    local spinner="/-\|"
-    NOTE "Waiting for k3s to be ready..."
-    for i in {1..300}; do
-        local nodes_status=$(kubectl get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[?(@.type=='Ready')].status" | awk 'NR>1')
-        local not_ready=$(echo "$nodes_status" | grep -v "True")
-        if [ -z "$not_ready" ]; then
-            kubectl get nodes
-            INFO "k3s is ready."
-            return 0
-        fi
-        echo -ne "\rk3s is not ready, waiting...[${spinner:i%4:1}], ${i}s"
-        sleep 1
-    done
+#     # --flannel-backend=wireguard-native,none
+#     # --node-external-ip $IPV4_LAN  \
+#     # TODO HAS_GOOGLE ?
+#     curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | INSTALL_K3S_MIRROR=cn sh -s - server \
+#         --token $TOKEN --cluster-init \
+#         --disable traefik \
+#         --disable servicelb \
+#         --disable-network-policy \
+#         --write-kubeconfig-mode 777 \
+#         --kube-proxy-arg "proxy-mode=ipvs" \
+#         --kube-proxy-arg "masquerade-all=true" \
+#         --kube-proxy-arg "metrics-bind-address=0.0.0.0" \
+#         --flannel-backend none \
+#         $TLS_SANS
+#     if ! command -v kubectl &>/dev/null; then
+#         ERROR "install k3s cli failed;" && exit
+#     fi
+#     local spinner="/-\|"
+#     NOTE "Waiting for k3s to be ready..."
+#     for i in {1..300}; do
+#         local nodes_status=$(kubectl get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[?(@.type=='Ready')].status" | awk 'NR>1')
+#         local not_ready=$(echo "$nodes_status" | grep -v "True")
+#         if [ -z "$not_ready" ]; then
+#             kubectl get nodes
+#             INFO "k3s is ready."
+#             return 0
+#         fi
+#         echo -ne "\rk3s is not ready, waiting...[${spinner:i%4:1}], ${i}s"
+#         sleep 1
+#     done
 
-    WARN "k3s did not become ready in the expected time."
-    # journalctl -xeu k3s.service  # 可根据需要解注释查看详细日志
-    # exit 1
-}
+#     WARN "k3s did not become ready in the expected time."
+#     # journalctl -xeu k3s.service  # 可根据需要解注释查看详细日志
+#     # exit 1
+# }
 
 system_install_k8s_auto() {
-    local K8S_INSTALLER=$(getarg installer $@)
     local K8S_CRI=$(getarg cri $@)
     local total_mem=$(free -g | grep Mem | awk '{print $2}')
     NOTE "check memory: ${total_mem}G"
 
-    if [ "$total_mem" -ge 8 ]; then
-        K8S_INSTALLER=${K8S_INSTALLER:-'sealos'} # 可选值：sealos, k3s, microk8s
-        K8S_CRI=${K8S_CRI:-'containerd'}         # 可选值：containerd, docker, k3s
-    elif [ "$total_mem" -ge 4 ]; then
-        K8S_INSTALLER=${K8S_INSTALLER:-'sealos'} # 可选值：sealos, k3s, microk8s
-        K8S_CRI=${K8S_CRI:-'k3s'}                # 可选值：containerd, docker, k3s
+    # 可选值：containerd, docker, k3s
+    if [ "$total_mem" -ge 16 ]; then
+        K8S_CRI=${K8S_CRI:-'containerd'}
     else
-        K8S_INSTALLER=${K8S_INSTALLER:-'k3s'} # 可选值：sealos, k3s, microk8s
-        K8S_CRI=${K8S_CRI:-'k3s'}             # 可选值：containerd, docker, k3s
+        K8S_CRI=${K8S_CRI:-'k3s'}
     fi
 
-    NOTE "install k8s: $K8S_INSTALLER, $K8S_CRI"
-    # 根据 K8S_INSTALLER 安装相应的 Kubernetes 版本
-    case "$K8S_INSTALLER" in
-    "sealos")
-        system_install_k8s_sealos $@
-        system_install_k8s_config
-        ;;
+    NOTE "install k8s with cri: $K8S_CRI"
 
-    "microk8s")
-        system_install_k8s_microk8s $@
-        system_install_k8s_config
-        ;;
-
-    "k3s")
-        system_install_k8s_k3s $@
-        system_install_k8s_config
-        ;;
-
-    *)
-        ERROR "K8S_INSTALLER must be sealos, microk8s, or k3s" && exit 1
-        ;;
-    esac
+    system_install_k8s_sealos $@
+    system_install_k8s_config
 
 }
 
@@ -1797,7 +1793,10 @@ system_install_k8s_config() {
     elif [ -f "/etc/kubernetes/admin.conf" ]; then
         export KUBECONFIG=/etc/kubernetes/admin.conf
     fi
-    INFO "export KUBECONFIG=$KUBECONFIG"
+
+    if [ -n "$KUBECONFIG" ]; then
+        INFO "export KUBECONFIG=$KUBECONFIG"
+    fi
 }
 
 system_uninstall_sealos() {
@@ -1918,6 +1917,68 @@ docker_install_crproxy() {
 # k8s core
 #
 ###################################################################################################
+
+k8s_install_nodeport_range() {
+    if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then
+        MANIFEST_FILE="/etc/kubernetes/manifests/kube-apiserver.yaml"
+        BACKUP_FILE="${MANIFEST_FILE}.bak.$(date +%s)"
+        TARGET_ARG="--service-node-port-range=1000-60000"
+
+        echo "🔧 修改 $MANIFEST_FILE ..."
+
+        if grep -q "$TARGET_ARG" "$MANIFEST_FILE"; then
+            echo "✅ 参数已存在，无需修改。"
+            exit 0
+        fi
+
+        echo "📦 备份原文件到 $BACKUP_FILE"
+        cp "$MANIFEST_FILE" "$BACKUP_FILE"
+
+        echo "✏️ 清理旧的 node-port-range 参数..."
+        sed -i -E "s/--service-node-port-range=[^ ]+//g" "$MANIFEST_FILE"
+
+        echo "➕ 追加参数 $TARGET_ARG 到 containers.command ..."
+
+        # 简单方式：找 command 数组中最后一条 -- 开头参数行，后面插入参数
+        sed -i "/- --/a \ \ \ \ \ \ - $TARGET_ARG" "$MANIFEST_FILE"
+
+        echo "✅ 修改完成，请等待 kubelet 自动重载该静态 Pod。"
+    fi
+    if [ -f /etc/systemd/system/k3s.service ]; then
+
+        local SERVICE_FILE="/etc/systemd/system/k3s.service"
+        local BACKUP_FILE="/etc/systemd/system/k3s.service.bak.$(date +%s)"
+        local TARGET_ARG="--kube-apiserver-arg service-node-port-range=1000-60000"
+
+        echo "🔍 检查 $SERVICE_FILE 是否已经包含正确参数..."
+
+        # 检查 ExecStart 行中是否已存在该参数
+        if grep -q "${TARGET_ARG}" "$SERVICE_FILE"; then
+            echo "✅ 已包含参数，无需修改。"
+            exit 0
+        fi
+
+        echo "🛠 备份原始文件到 $BACKUP_FILE"
+        cp "$SERVICE_FILE" "$BACKUP_FILE"
+
+        echo "✏️ 修改 ExecStart 行..."
+
+        # 删除已有的 service-node-port-range 参数（如有），防止冲突
+        sed -i -E "/^ExecStart=/ s/--kube-apiserver-arg service-node-port-range=[^ ]+//g" "$SERVICE_FILE"
+
+        # 然后追加目标参数
+        sed -i "/^ExecStart=/ s|$| ${TARGET_ARG}|" "$SERVICE_FILE"
+
+        cat "$SERVICE_FILE"
+
+        echo "🔄 重新加载 systemd 配置并重启 k3s 服务..."
+        systemctl daemon-reexec
+        systemctl daemon-reload
+        systemctl restart k3s
+
+        echo "✅ 修改完成并重启 k3s 成功。"
+    fi
+}
 
 k8s_install_gateway_api() {
     # Gateway API CRD
@@ -2072,11 +2133,15 @@ k8s_install_cilium() {
     local cilium_version=${cilium_version:-$latest_version}
     local cilium_version=${cilium_version:-"1.16.5"}
 
+    #   https://docs.cilium.io/en/stable/network/concepts/ipam/
+    local ipam=$(getarg ipam $@)
+    local ipam=${ipam:-"kubernetes"} # cluster-pool,kubernetes ;
+
     kubectl -n kube-system delete ds kube-proxy 2>/dev/null || true
     kubectl -n kube-system delete cm kube-proxy 2>/dev/null || true
 
     if command -v sealos &>/dev/null; then
-        if ! command -v cilium &>/dev/null || ! kubectl -n kube-system get daemonset cilium ] &>/dev/null; then
+        if ! command -v cilium &>/dev/null || ! kubectl -n kube-system get daemonset cilium &>/dev/null; then
             echo "cilium not installed, try to install with sealos"
             local cluster=$(getarg cluster $@)
             local cluster==${cluster:-"$CLUSTER"}
@@ -2085,10 +2150,16 @@ k8s_install_cilium() {
             ip link delete cni0 2>/dev/null || true
             ip link delete cilium_vxlan 2>/dev/null || true
 
+            local ExtraValues="kubeProxyReplacement=true"
+            local ExtraValues=$ExtraValues",ipam.mode=${ipam}"
+            local ExtraValues=$ExtraValues",autoDirectNodeRoutes=true"
+            local ExtraValues=$ExtraValues",tunnel=vxlan"
+            local ExtraValues=$ExtraValues",ipv4NativeRoutingCIDR=10.11.0.0/16"
+            local ExtraValues=$ExtraValues",ipam.operator.clusterPoolIPv4PodCIDRList=10.44.0.0/16"
             # https://github.com/labring-actions/cluster-image/blob/main/applications/cilium
             sudo sealos run --cluster $cluster \
                 -f ${labring_image_registry}/${labring_image_repository}/cilium:v${cilium_version} \
-                --env ExtraValues="kubeProxyReplacement=true,ipam.mode=kubernetes,autoDirectNodeRoutes=true,tunnel=vxlan,ipv4NativeRoutingCIDR=10.11.0.0/16"
+                --env ExtraValues="$ExtraValues"
         fi
     fi
 
@@ -2126,11 +2197,24 @@ k8s_install_cilium() {
             ERROR "KUBECONFIG is not set" && exit 1
         fi
         cilium install --version $cilium_version \
-            --set ipam.mode=kubernetes \
+            --set ipam.mode=${ipam} \
             --set kubeProxyReplacement=true \
             --set tunnel=vxlan \
             --set autoDirectNodeRoutes=true \
-            --set ipv4NativeRoutingCIDR=10.11.0.0/16
+            --set ipv4NativeRoutingCIDR=10.11.0.0/16 \
+            --set ipam.operator.clusterPoolIPv4PodCIDRList="10.44.0.0/16"
+    fi
+
+    if [ "$(hasarg upgrade $@)" == true ]; then
+        NOTE "Upgrading Cilium to version $cilium_version"
+        cilium upgrade --version $cilium_version \
+            --set ipam.mode=${ipam} \
+            --set bpf.masquerade=true \
+            --set kubeProxyReplacement=true \
+            --set tunnel=vxlan \
+            --set autoDirectNodeRoutes=true \
+            --set ipv4NativeRoutingCIDR=10.11.0.0/16 \
+            --set ipam.operator.clusterPoolIPv4PodCIDRList="10.44.0.0/16"
     fi
 
     wait_for_cilium() {
@@ -2150,6 +2234,18 @@ k8s_install_cilium() {
         exit 1
     }
     wait_for_cilium
+
+}
+
+k8s_uninstall_cilium() {
+    if command -v cilium &>/dev/null; then
+        cilium uninstall
+    fi
+    for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+        if kubectl describe node "$node" | grep -q 'node.cilium.io/agent-not-ready:NoSchedule'; then
+            kubectl taint nodes "$node" node.cilium.io/agent-not-ready:NoSchedule-
+        fi
+    done
 
 }
 
@@ -2203,16 +2299,12 @@ k8s_install_higress() {
             --set higress-core.gateway.resources.requests.memory=128Mi \
             --set higress-core.gateway.resources.limits.cpu=256m \
             --set higress-core.gateway.resources.limits.memory=128Mi \
-            --set higress-core.gateway.tolerations[0].key=node-role.kubernetes.io/control-plane \
-            --set higress-core.gateway.tolerations[0].operator=Exists \
-            --set higress-core.gateway.tolerations[0].effect=NoSchedule \
             --set higress-core.controller.replicas=1 \
             --set higress-core.controller.service.type=ClusterIP \
             --set higress-core.controller.resources.requests.cpu=256m \
             --set higress-core.controller.resources.requests.memory=128Mi \
             --set higress-core.controller.resources.limits.cpu=256m \
             --set higress-core.controller.resources.limits.memory=128Mi \
-            --set "higress-core.controller.nodeSelector.node-role\.kubernetes\.io\/control-plane=" \
             --set higress-core.pilot.replicaCount=1 \
             --set higress-core.pilot.resources.limits.cpu=256m \
             --set higress-core.pilot.resources.limits.memory=128Mi \
@@ -2223,6 +2315,10 @@ k8s_install_higress() {
             --set higress-console.resources.requests.cpu=128m \
             --set higress-console.resources.requests.memory=128Mi \
             --set higress-console.certmanager.enabled=false
+        # --set higress-core.gateway.tolerations[0].key=node-role.kubernetes.io/control-plane \
+        # --set higress-core.gateway.tolerations[0].operator=Exists \
+        # --set higress-core.gateway.tolerations[0].effect=NoSchedule \
+        # --set "higress-core.controller.nodeSelector.node-role\.kubernetes\.io\/control-plane=" \
         kubectl -n higress-system wait --for=condition=Ready pods --all
         kubectl get po -n higress-system
     elif command -v sealos >/dev/null 2>&1; then
@@ -2335,8 +2431,6 @@ k8s_install_config() {
 }
 
 k8s_install_core() {
-
-    k8s_install_config
 
     k8s_install_helm $@
 
@@ -2465,10 +2559,10 @@ k8s_install_frps() {
     local port_ui=${port_ui:-7500}
 
     local port_http=$(getarg port_http $@)
-    local port_http=${port_http:-8080}
+    local port_http=${port_http:-7501}
 
     local port_tcp=$(getarg port_tcp $@)
-    local port_tcp=${port_tcp:-8000}
+    local port_tcp=${port_tcp:-7502}
 
     cat <<EOF >${tmpdir}/${FRPS_TOML}
 bindPort = ${port_bind}
@@ -2498,14 +2592,13 @@ EOF
 
     cat <<EOF >${tmpdir}/${FRPS_YAML}
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: frps
   namespace: ${namespace}
   labels:
     app: frps
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: frps
@@ -2546,39 +2639,43 @@ metadata:
   name: frps
   namespace: ${namespace:-default}
 spec:
-  type: ClusterIP
+  type: NodePort
   ports:
     - protocol: TCP
       name: bind
       port: ${port_bind}
       targetPort: ${port_bind}
+      nodePort: ${port_bind}
     - protocol: TCP
       name: http
       port: ${port_http}
       targetPort: ${port_http}
+      nodePort: ${port_http}
     - protocol: TCP
       name: tcp
       port: ${port_tcp}
       targetPort: ${port_tcp}
+      nodePort: ${port_tcp}
     - protocol: TCP
       name: ui
       port: ${port_ui}
       targetPort: ${port_ui}
+      nodePort: ${port_ui}
   selector:
     app: frps
 " | kubectl apply -f -
 
-    local bind_route_rule=$(getarg bind_route_rule $@)
-    local bind_route_rule=${bind_route_rule:-'frps.localhost'}
+    local bind_routes=$(getarg bind_routes $@)
+    local bind_routes=${bind_routes:-'frps.localhost'}
 
-    local dashboard_route_rule=$(getarg dashboard_route_rule $@)
-    local dashboard_route_rule=${dashboard_route_rule:-'frps-ui.localhost'}
+    local dashboard_routes=$(getarg dashboard_routes $@)
+    local dashboard_routes=${dashboard_routes:-'frps-ui.localhost'}
 
-    local http_route_rule=$(getarg http_route_rule $@)
-    local http_route_rule=${http_route_rule:-'frps-http-*.localhost'}
+    local http_routes=$(getarg http_routes $@)
+    local http_routes=${http_routes:-'frp-http.localhost'}
 
-    local tcp_route_rule=$(getarg tcp_route_rule $@)
-    local tcp_route_rule=${tcp_route_rule:-'frps-tcp-*localhost'}
+    local tcp_routes=$(getarg tcp_routes $@)
+    local tcp_routes=${tcp_routes:-'frp-tcp.localhost'}
 
     local srv_name=$(kubectl get service -n ${namespace} | grep frps | awk '{print $1}')
 
@@ -2588,7 +2685,7 @@ spec:
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_bind \
-        --domain ${bind_route_rule}
+        --domain ${bind_routes}
 
     k8s_install_ingress_rule \
         --name frps-ui \
@@ -2596,7 +2693,7 @@ spec:
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_ui \
-        --domain ${dashboard_route_rule}
+        --domain ${dashboard_routes}
 
     k8s_install_ingress_rule \
         --name frps-http \
@@ -2604,7 +2701,7 @@ spec:
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_http \
-        --domain ${http_route_rule}
+        --domain ${http_routes}
 
     k8s_install_ingress_rule \
         --name frps-tcp \
@@ -2612,7 +2709,7 @@ spec:
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_tcp \
-        --domain ${tcp_route_rule}
+        --domain ${tcp_routes}
 
     rm -rf ${tmpdir}
 
@@ -2653,10 +2750,12 @@ while [ $# -gt 0 ]; do
         ;;
     -ki | --k8s-install)
         NOTE "================ k8s-install $2"
+        k8s_install_config
         eval "k8s_install_$2 $@"
         ;;
     -kr | --k8s-uninstall)
         NOTE "================ k8s-uninstall $2"
+        k8s_install_config
         eval "k8s_uninstall_$2 $@"
         ;;
     -onekey | --onekey)
