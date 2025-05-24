@@ -1,6 +1,5 @@
 #!/bin/sh
 set -e
-
 ###################################################################################################
 #
 # env
@@ -498,7 +497,7 @@ if [ ! -n "$IPV4_WAN" ]; then
 fi
 INFO "ENV IPV4_WAN: ${IPV4_WAN}"
 
-PING_GCR=$(curl -Is http://gcr.io --silent --connect-timeout 5 --max-time 5 | head -n 1)
+PING_GCR=$(curl -Is http://gcr.io --silent --connect-timeout 2 --max-time 2 | head -n 1)
 if echo "$PING_GCR" | grep -q "HTTP/1.1 200 OK"; then
     HAS_GCR="true"
 elif echo "$PING_GCR" | grep -q "HTTP/1.1 301 Moved Permanently"; then
@@ -508,7 +507,7 @@ else
 fi
 INFO "ENV HAS_GCR: ${HAS_GCR:-"false"}"
 
-PING_GOOGLE=$(curl -Is http://google.com --silent --connect-timeout 5 --max-time 5 | head -n 1)
+PING_GOOGLE=$(curl -Is http://google.com --silent --connect-timeout 2 --max-time 2 | head -n 1)
 if echo "$PING_GOOGLE" | grep -q "HTTP/1.1 200 OK"; then
     HAS_GOOGLE="true"
 elif echo "$PING_GOOGLE" | grep -q "HTTP/1.1 301 Moved Permanently"; then
@@ -843,6 +842,7 @@ net.core.somaxconn = 32768
 vm.swappiness = 0
 net.ipv4.tcp_syncookies = 0
 net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding=1
 fs.file-max = 1000000
 fs.inotify.max_user_watches = 1048576
 fs.inotify.max_user_instances = 1024
@@ -882,6 +882,14 @@ EOF
     if command -v git &>/dev/null; then
         git config --global credential.helper store
     fi
+
+    # # 配置防火墙规则
+    # iptables -P INPUT ACCEPT
+    # iptables -P FORWARD ACCEPT
+    # iptables -P OUTPUT ACCEPT
+    # iptables -F
+    # iptables --flush
+    # iptables -tnat --flush
 
     if command -v neofetch &>/dev/null; then
         local MOTD=/etc/motd
@@ -1247,6 +1255,8 @@ system_uninstall_cri() {
     sudo rm -f /etc/systemd/system/docker.service.d/*
     sudo rm -f /etc/systemd/system/containerd.service.d/*
 
+    sudo rm -rf /etc/cni /opt/cni /var/lib/cni /var/lib/rancher/k3s
+
     if command -v journalctl &>/dev/null; then
         sudo journalctl --vacuum-time=1d
     fi
@@ -1264,13 +1274,8 @@ system_uninstall_cri() {
 #
 ###################################################################################################
 set_cr_mirrors_host() {
-    if ! command -v containerd &>/dev/null; then
-        echo "ERROR: containerd command not found" >&2
-        exit 1
-    fi
 
     export PS4='\[\e[35m\]+ $(basename $0):${FUNCNAME}:${LINENO}: \[\e[0m\]'
-    [ "$debug" == "true" ] || [ "$debug" == "yes" ] && set -x
 
     local config_path="/etc/containerd/certs.d"
     mkdir -p "$config_path"
@@ -1319,21 +1324,22 @@ set_cr_mirrors_host() {
     local i=0
     while [ $i -lt ${#registries[@]} ]; do
         local registry="${registries[$i]}"
-        ((i++))
+        let i=i+1
         local prefixes=()
         while [ $i -lt ${#registries[@]} ] && [[ "${registries[$i]}" != *.* ]]; do
             prefixes+=("${registries[$i]}")
-            ((i++))
+            let i=i+1
         done
 
         local hosts_dir="$config_path/$registry"
         mkdir -p "$hosts_dir"
-
         if ! generate_hosts_toml "$registry" "${prefixes[@]}" >"$hosts_dir/hosts.toml"; then
             NOTE "未设置镜像，加速未启用，删除 $hosts_dir"
             rm -rf "$hosts_dir"
         fi
     done
+
+    ls -al $config_path
 
     NOTE "containerd 镜像加速配置已完成：$config_path"
 }
@@ -1426,6 +1432,36 @@ EOF
     done
 
     cat "$registries_file"
+
+    if [ -d "/etc/rancher/k3s" ]; then
+        NOTE "restart k3s"
+        systemctl restart k3s
+    fi
+    if [ -d "/var/snap/microk8s/current/args" ]; then
+        if command -v microk8s &>/dev/null; then
+            NOTE "restart k3s microk8s"
+            microk8s.stop
+            microk8s.start
+        fi
+    fi
+    if command -v containerd &>/dev/null 2>&1; then
+        NOTE "restart containerd"
+        systemctl restart containerd
+    fi
+}
+
+set_cr_mirrors_auto() {
+    if [ -z "$HAS_GCR" ]; then
+        if [ -d "/etc/containerd/certs.d" ]; then
+            set_cr_mirrors_host $@
+        fi
+        if [ -d "/etc/rancher/k3s" ]; then
+            set_cr_mirrors_registries $@
+        fi
+        if [ -d "/var/snap/microk8s/current/args" ]; then
+            set_cr_mirrors_registries $@
+        fi
+    fi
 }
 
 set_linux_mirrors_official() {
@@ -1626,6 +1662,7 @@ system_install_k8s_sealos() {
     local masters=$(getarg masters $@)
     local add_masters=$(getarg add_masters $@)
     local add_nodes=$(getarg add_nodes $@)
+    local external_ips=$(getarg external_ips $@)
     local sshpwd=$(getarg sshpwd $@)
     local cri=$(getarg cri $@)
     local cri=${cri:-$K8S_CRI}
@@ -1633,7 +1670,7 @@ system_install_k8s_sealos() {
     local k8s_version=${k8s_version:-$K8S_VERSION}
 
     local cluster=$(getarg cluster $@)
-    local cluster==${cluster:-"$CLUSTER"}
+    local cluster=${cluster:-"$CLUSTER"}
 
     if [ -z "$masters" ] && [ -z "$add_masters" ] && [ -z "$add_nodes" ]; then
         ERROR "masters, add_masters, add_nodes at least one should be set" && exit 1
@@ -1666,10 +1703,13 @@ system_install_k8s_sealos() {
             -p ${sshpwd}
     fi
     if [ -n "$add_masters" ]; then
-        sealos add --masters $add_masters -p ${sshpwd}
+        sealos add --cluster $cluster --masters $add_masters -p ${sshpwd}
     fi
     if [ -n "$add_nodes" ]; then
-        sealos add --nodes $add_nodes -p ${sshpwd}
+        sealos add --cluster $cluster --nodes $add_nodes -p ${sshpwd}
+    fi
+    if [ -n "$external_ips" ]; then
+        sealos cert --cluster $cluster --alt-names $external_ips
     fi
 }
 
@@ -1762,29 +1802,6 @@ system_install_k8s() {
     system_install_k8s_auto $@
 }
 
-system_install_k8s_cr_mirrors_registries() {
-    if [ -z "$HAS_GCR" ]; then
-
-        set_cr_mirrors_registries $@
-
-        if [ -d "/etc/rancher/k3s" ]; then
-            NOTE "restart k3s"
-            systemctl restart k3s
-        fi
-        if [ -d "/var/snap/microk8s/current/args" ]; then
-            if command -v microk8s &>/dev/null; then
-                NOTE "restart k3s microk8s"
-                microk8s.stop
-                microk8s.start
-            fi
-        fi
-        if command -v containerd >/dev/null 2>&1; then
-            NOTE "restart containerd"
-            systemctl restart containerd
-        fi
-    fi
-}
-
 system_install_k8s_config() {
     if [ -f "/etc/rancher/k3s/k3s.yaml" ]; then
         export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -1808,7 +1825,7 @@ system_uninstall_sealos() {
         local nodes=$(getarg nodes $@)
         local sshpwd=$(getarg sshpwd $@)
 
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
 
         if [ -z $sshpwd ]; then
             ERROR "missing --sshpwd <password>" && exit 1
@@ -1878,7 +1895,7 @@ system_uninstall_k8s() {
 docker_install_crproxy() {
     local DOMAIN=$(getarg domain $@)
     local DOMAIN=${DOMAIN:-$CRPROXY}
-    if command -v docker 2>/dev/null 2>&1; then
+    if command -v docker &>/dev/null 2>&1; then
         local VERSION=$(get_github_release_version "DaoCloud/crproxy")
         docker rm -f crproxy
         docker run -dit \
@@ -1918,64 +1935,186 @@ docker_install_crproxy() {
 #
 ###################################################################################################
 
-k8s_install_nodeport_range() {
+k8s_install_acme() {
+    local domain=$(getarg domain $@)
+    local domain=${domain:-"${DOMAIN}"}
+    local solver=$(getarg solver $@)
+    local solver=${solver:-"${ACME_DNS}"}
+    if [ -z "$solver" ]; then
+        ERROR "missing --solver <solver>" && exit 1
+    fi
+    local secretId=$(getarg secret_id $@)
+    local secretId=${secretId:-"${ACME_DNS_ID}"}
+    local secretKey=$(getarg secret_key $@)
+    local secretKey=${secretKey:-"${ACME_DNS_KEY}"}
+
+    echo "ENV domain: ${domain}"
+    echo "ENV solver: ${solver}"
+    echo "ENV secretId: ${secretId}"
+    echo "ENV secretKey: ${secretKey}"
+
+    if [ "$solver" == "dnspod" ] || [ "$solver" == "dns_dp" ]; then
+        # https://imroc.cc/kubernetes/certs/sign-free-certs-for-dnspod
+        # https://github.com/imroc/cert-manager-webhook-dnspod
+        if [ -z "$secretId" ] || [ -z "$secretKey" ]; then
+            ERROR "missing --secretId <secretId> or --secretKey <secretKey>" && exit 1
+        fi
+        kubectl apply -f ${GHPROXY}https://raw.githubusercontent.com/imroc/cert-manager-webhook-dnspod/master/bundle.yaml
+
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dnspod-secret-${domain}
+  namespace: cert-manager
+type: Opaque
+stringData:
+  secretId: "${secretId}"
+  secretKey: "${secretKey}"
+EOF
+
+        kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: dnspod-${domain}
+  namespace: cert-manager
+spec:
+  acme:
+    email: acme@${domain}
+    privateKeySecretRef:
+      name: dnspod-letsencrypt-${domain}
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+      - dns01:
+          webhook:
+            config:
+              secretIdRef:
+                key: secretId
+                name: dnspod-secret-${domain}
+              secretKeyRef:
+                key: secretKey
+                name: dnspod-secret-${domain}
+              ttl: 600
+              recordLine: ""
+            groupName: acme.dnspod.com
+            solverName: dnspod
+EOF
+
+        kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${domain}-crt
+  namespace: cert-manager
+spec:
+  secretName: ${domain}-crt
+  issuerRef:
+    name: dnspod-${domain}
+    kind: ClusterIssuer
+    group: cert-manager.io
+  dnsNames:
+    - "${domain}"
+    - "*.${domain}"
+EOF
+
+    elif [ "$solver" == "ali" ] || [ "$solver" == "dns_ali" ]; then
+        echo "ali not support"
+    elif [ "$solver" == "namesilo" ] || [ "$solver" == "dns_namesilo" ]; then
+        echo "namesilo not support"
+    else
+        ERROR "ENV solver: $solver is invalid, please use dnspod, ali, namesilo"
+        exit 1
+    fi
+
+    # 重启cert-manager-webhook-dnspod
+    kubectl delete pod -n cert-manager -l app=cert-manager-webhook-dnspod
+
+    # 查看证书状态
+    kubectl describe certificate ${domain}-crt
+
+    # 查看 cert-manager 日志
+    # kubectl logs -n cert-manager deploy/cert-manager
+
+}
+
+k8s_install_nodeport() {
+    local range=$(getarg range $@)
+
+    if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local start=${BASH_REMATCH[1]}
+        local end=${BASH_REMATCH[2]}
+        if [ $start -le $end ]; then
+            echo "" >/dev/null
+        else
+            ERROR "ENV range: $range is invalid, please use start <= end"
+            exit 1
+        fi
+
+        if [ $start -ge 1 ] && [ $start -le 65535 ] && [ $end -ge 1 ] && [ $end -le 65535 ]; then
+            echo "" >/dev/null
+        else
+            ERROR "ENV range: $range is invalid, please use 1-65535"
+            exit 1
+        fi
+    else
+        ERROR "ENV range: $range is invalid, please use 1-65535"
+        exit 1
+    fi
+
+    local range=${range:-"1000-60000"}
+
     if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then
-        MANIFEST_FILE="/etc/kubernetes/manifests/kube-apiserver.yaml"
-        BACKUP_FILE="${MANIFEST_FILE}.bak.$(date +%s)"
-        TARGET_ARG="--service-node-port-range=1000-60000"
-
+        local MANIFEST_FILE="/etc/kubernetes/manifests/kube-apiserver.yaml"
+        local BACKUP_FILE="${MANIFEST_FILE}.bak.$(date +%s)"
+        local TARGET_ARG="service-node-port-range=${range}"
         echo "🔧 修改 $MANIFEST_FILE ..."
-
         if grep -q "$TARGET_ARG" "$MANIFEST_FILE"; then
             echo "✅ 参数已存在，无需修改。"
             exit 0
         fi
-
-        echo "📦 备份原文件到 $BACKUP_FILE"
-        cp "$MANIFEST_FILE" "$BACKUP_FILE"
-
-        echo "✏️ 清理旧的 node-port-range 参数..."
-        sed -i -E "s/--service-node-port-range=[^ ]+//g" "$MANIFEST_FILE"
-
+        \cp -rf "$MANIFEST_FILE" "$BACKUP_FILE"
+        # 如果有备份文件不会生效, 移走后生效
+        \mv -f "$BACKUP_FILE" ${TEMP}/
+        echo "📦 备份原文件到 ${TEMP}/$(basename "$BACKUP_FILE")"
+        echo "✏️ 清理旧的 node-port-range 参数整行..."
+        sed -i '/--service-node-port-range=/d' "$MANIFEST_FILE"
         echo "➕ 追加参数 $TARGET_ARG 到 containers.command ..."
-
-        # 简单方式：找 command 数组中最后一条 -- 开头参数行，后面插入参数
-        sed -i "/- --/a \ \ \ \ \ \ - $TARGET_ARG" "$MANIFEST_FILE"
-
-        echo "✅ 修改完成，请等待 kubelet 自动重载该静态 Pod。"
+        # 只在第一个 "- --" 行后面插入一次
+        sed -i "/^[[:space:]]*- kube-apiserver$/a \    - --${TARGET_ARG}" "$MANIFEST_FILE"
+        if command -v kubelet &>/dev/null; then
+            echo "✅ 发现 kubelet，修改 static pod 后将自动生效。"
+        else
+            echo "⚠️ 未发现 kubelet，尝试重启 containerd..."
+            if command -v containerd &>/dev/null; then
+                systemctl restart containerd 2>/dev/null && echo "✅ 已尝试重启 containerd。"
+            else
+                echo "❌ 未找到 containerd，无法重启。"
+            fi
+        fi
     fi
     if [ -f /etc/systemd/system/k3s.service ]; then
-
         local SERVICE_FILE="/etc/systemd/system/k3s.service"
         local BACKUP_FILE="/etc/systemd/system/k3s.service.bak.$(date +%s)"
-        local TARGET_ARG="--kube-apiserver-arg service-node-port-range=1000-60000"
-
+        local TARGET_ARG="--kube-apiserver-arg service-node-port-range=${range}"
         echo "🔍 检查 $SERVICE_FILE 是否已经包含正确参数..."
-
         # 检查 ExecStart 行中是否已存在该参数
         if grep -q "${TARGET_ARG}" "$SERVICE_FILE"; then
             echo "✅ 已包含参数，无需修改。"
             exit 0
         fi
-
         echo "🛠 备份原始文件到 $BACKUP_FILE"
         cp "$SERVICE_FILE" "$BACKUP_FILE"
-
         echo "✏️ 修改 ExecStart 行..."
-
         # 删除已有的 service-node-port-range 参数（如有），防止冲突
         sed -i -E "/^ExecStart=/ s/--kube-apiserver-arg service-node-port-range=[^ ]+//g" "$SERVICE_FILE"
-
         # 然后追加目标参数
         sed -i "/^ExecStart=/ s|$| ${TARGET_ARG}|" "$SERVICE_FILE"
-
         cat "$SERVICE_FILE"
-
         echo "🔄 重新加载 systemd 配置并重启 k3s 服务..."
         systemctl daemon-reexec
         systemctl daemon-reload
         systemctl restart k3s
-
         echo "✅ 修改完成并重启 k3s 成功。"
     fi
 }
@@ -1988,9 +2127,9 @@ k8s_install_gateway_api() {
 }
 
 k8s_install_longhorn() {
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version longhorn)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/longhorn:${latest_version}
@@ -1998,13 +2137,13 @@ k8s_install_longhorn() {
 }
 
 k8s_install_openebs() {
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version openebs)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/openebs:${latest_version}
-    elif command -v helm >/dev/null 2>&1; then
+    elif command -v helm &>/dev/null 2>&1; then
         helm repo add openebs https://openebs.github.io/openebs
         helm repo update
         helm upgrade --install openebs \
@@ -2021,9 +2160,9 @@ k8s_install_openebs() {
 
 k8s_install_istio() {
     local profile=$(getarg profile $@)
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version istio)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/istio:${latest_version} \
@@ -2041,7 +2180,7 @@ k8s_install_helm() {
     if ! command -v helm &>/dev/null; then
         if command -v sealos &>/dev/null; then
             local cluster=$(getarg cluster $@)
-            local cluster==${cluster:-"$CLUSTER"}
+            local cluster=${cluster:-"$CLUSTER"}
             # https://github.com/labring-actions/cluster-image/blob/main/applications/helm
             local latest_version=$(get_sealos_release_version helm)
             sudo sealos run --cluster $cluster \
@@ -2079,11 +2218,11 @@ k8s_install_helm() {
 
     if command -v helm &>/dev/null; then
         helm version
-        helm repo add aliyun https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts >/dev/null
-        helm repo add kaiyuanshe http://mirror.kaiyuanshe.cn/kubernetes/charts >/dev/null
-        # helm repo add dandydev https://dandydeveloper.github.io/charts >/dev/null
-        helm repo add azure http://mirror.azure.cn/kubernetes/charts >/dev/null
-        helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null
+        helm repo add aliyun https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts >/dev/null || true
+        helm repo add kaiyuanshe http://mirror.kaiyuanshe.cn/kubernetes/charts >/dev/null || true
+        # helm repo add dandydev https://dandydeveloper.github.io/charts >/dev/null || true
+        helm repo add azure http://mirror.azure.cn/kubernetes/charts >/dev/null || true
+        helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null || true
     else
         ERROR "Helm installation failed."
         exit 1
@@ -2091,9 +2230,9 @@ k8s_install_helm() {
 }
 
 k8s_install_cert_manager() {
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version cert-manager)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/cert-manager:${latest_version}
@@ -2131,31 +2270,83 @@ k8s_install_cilium() {
     local latest_version=${latest_version#v}
     local cilium_version=$(getarg cilium_version $@)
     local cilium_version=${cilium_version:-$latest_version}
-    local cilium_version=${cilium_version:-"1.16.5"}
+    local cilium_version=${cilium_version:-"1.15.8"}
 
     #   https://docs.cilium.io/en/stable/network/concepts/ipam/
     local ipam=$(getarg ipam $@)
     local ipam=${ipam:-"kubernetes"} # cluster-pool,kubernetes ;
 
-    kubectl -n kube-system delete ds kube-proxy 2>/dev/null || true
-    kubectl -n kube-system delete cm kube-proxy 2>/dev/null || true
+    local kubeProxyReplacement=$(getarg kubeProxyReplacement $@)
+    local kubeProxyReplacement=${kubeProxyReplacement:-"true"}
+
+    local ingress=$(getarg ingress $@)
+    local ingress=${ingress:-"false"}
+
+    local gatewayAPI=$(getarg gateway_api $@)
+    local gatewayAPI=${gatewayAPI:-"true"}
+
+    local envoy=$(getarg envoy $@)
+    local envoy=${envoy:-"true"}
+
+    #     cat <<EOF >/etc/sysctl.d/99-zzz-override_cilium.conf
+    # # Disable rp_filter on Cilium interfaces since it may cause mangled packets to be dropped
+    # net.ipv4.conf.lxc*.rp_filter = 0
+    # net.ipv4.conf.cilium_*.rp_filter = 0
+    # # The kernel uses max(conf.all, conf.{dev}) as its value, so we need to set .all. to 0 as well.
+    # # Otherwise it will overrule the device specific settings.
+    # net.ipv4.conf.all.rp_filter = 0
+    # EOF
+    # cat /etc/sysctl.d/99-zzz-override_cilium.conf
+    # sysctl -p /etc/sysctl.d/99-zzz-override_cilium.conf
+
+    if [ "$kubeProxyReplacement" == "true" ]; then
+        kubectl -n kube-system delete ds kube-proxy 2>/dev/null || true
+        kubectl -n kube-system delete cm kube-proxy 2>/dev/null || true
+    fi
+
+    local ExtraValues=","
+    if [ -n "${ipam}" ]; then
+        local ExtraValues=$ExtraValues",ipam.mode=${ipam}"
+    fi
+    if [ -n "${kubeProxyReplacement}" ]; then
+        local ExtraValues=$ExtraValues",kubeProxyReplacement=${kubeProxyReplacement}"
+        local ExtraValues=$ExtraValues",nodePort.enabled=true"
+    fi
+    local ExtraValues=$ExtraValues",global.nodeinit.enabled=true"
+    local ExtraValues=$ExtraValues",ipam.Operator.ClusterPoolIPv4MaskSize=24"
+    local ExtraValues=$ExtraValues",ipam.operator.clusterPoolIPv4PodCIDRList=10.42.0.0/16"
+    local ExtraValues=$ExtraValues",ipv4NativeRoutingCIDR=10.42.0.0/16"
+    local ExtraValues=$ExtraValues",routingMode=native"
+    local ExtraValues=$ExtraValues",autoDirectNodeRoutes=true"
+    local ExtraValues=$ExtraValues",tunnel=diabled"
+    local ExtraValues=$ExtraValues",bpf.masquerade=true"
+    local ExtraValues=$ExtraValues",bpf.hostLegacyRouting=true"
+    local ExtraValues=$ExtraValues",loadBalancer.mode=hybrid"
+    if [ "${gatewayAPI}" = "true" ]; then
+        local ExtraValues=$ExtraValues",gatewayAPI.enabled=true"
+        local ExtraValues=$ExtraValues",gatewayAPI.hostNetwork.enabled=true"
+    fi
+    if [ "${ingress}" = "true" ]; then
+        local ExtraValues=$ExtraValues",ingressController.enabled=${ingress}"
+        local ExtraValues=$ExtraValues",ingressController.loadbalancerMode=shared"
+    fi
+    if [ "${envoy}" = "true" ]; then
+        local ExtraValues=$ExtraValues",envoy.enabled=true"
+        local ExtraValues=$ExtraValues",envoy.securityContext.keepCapNetBindService=true"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[0]=NET_BIND_SERVICE"
+    fi
+    local ExtraValues="$(echo "$ExtraValues" | sed -E 's/,+/,/g')"
 
     if command -v sealos &>/dev/null; then
-        if ! command -v cilium &>/dev/null || ! kubectl -n kube-system get daemonset cilium &>/dev/null; then
+        if ! command -v cilium &>/dev/null; then
             echo "cilium not installed, try to install with sealos"
             local cluster=$(getarg cluster $@)
-            local cluster==${cluster:-"$CLUSTER"}
+            local cluster=${cluster:-"$CLUSTER"}
 
             ip link delete flannel.1 2>/dev/null || true
             ip link delete cni0 2>/dev/null || true
             ip link delete cilium_vxlan 2>/dev/null || true
 
-            local ExtraValues="kubeProxyReplacement=true"
-            local ExtraValues=$ExtraValues",ipam.mode=${ipam}"
-            local ExtraValues=$ExtraValues",autoDirectNodeRoutes=true"
-            local ExtraValues=$ExtraValues",tunnel=vxlan"
-            local ExtraValues=$ExtraValues",ipv4NativeRoutingCIDR=10.11.0.0/16"
-            local ExtraValues=$ExtraValues",ipam.operator.clusterPoolIPv4PodCIDRList=10.44.0.0/16"
             # https://github.com/labring-actions/cluster-image/blob/main/applications/cilium
             sudo sealos run --cluster $cluster \
                 -f ${labring_image_registry}/${labring_image_repository}/cilium:v${cilium_version} \
@@ -2196,25 +2387,27 @@ k8s_install_cilium() {
         if [ -z "$KUBECONFIG" ]; then
             ERROR "KUBECONFIG is not set" && exit 1
         fi
-        cilium install --version $cilium_version \
-            --set ipam.mode=${ipam} \
-            --set kubeProxyReplacement=true \
-            --set tunnel=vxlan \
-            --set autoDirectNodeRoutes=true \
-            --set ipv4NativeRoutingCIDR=10.11.0.0/16 \
-            --set ipam.operator.clusterPoolIPv4PodCIDRList="10.44.0.0/16"
+
+        local ExtraValues=${ExtraValues//,/ --set }
+        eval "echo $ExtraValues && cilium install --version $cilium_version $ExtraValues"
     fi
 
     if [ "$(hasarg upgrade $@)" == true ]; then
+        # local latest_version=$(get_github_release_version cilium/cilium)
+        # local latest_version=${latest_version#v}
+        local cilium_version=${cilium_version:-${latest_version}}
         NOTE "Upgrading Cilium to version $cilium_version"
-        cilium upgrade --version $cilium_version \
-            --set ipam.mode=${ipam} \
-            --set bpf.masquerade=true \
-            --set kubeProxyReplacement=true \
-            --set tunnel=vxlan \
-            --set autoDirectNodeRoutes=true \
-            --set ipv4NativeRoutingCIDR=10.11.0.0/16 \
-            --set ipam.operator.clusterPoolIPv4PodCIDRList="10.44.0.0/16"
+        local ExtraValues=${ExtraValues//,/ --set }
+
+        eval "echo $ExtraValues && cilium upgrade --version $cilium_version $ExtraValues"
+
+        # eval "echo $ExtraValues && cilium upgrade \
+        #     --version $latest_version \
+        #     --reuse-values $ExtraValues \
+        #     --set preflight.enabled=true \
+        #     --set agent=false \
+        #     --set operator.enabled=false \
+        # "
     fi
 
     wait_for_cilium() {
@@ -2246,7 +2439,8 @@ k8s_uninstall_cilium() {
             kubectl taint nodes "$node" node.cilium.io/agent-not-ready:NoSchedule-
         fi
     done
-
+    kubectl get secret --all-namespaces | grep cilium | awk '{print "kubectl -n "$1" delete secret "$2}' | bash
+    kubectl delete daemonset,deployment,svc,cm,secret,clusterrole,clusterrolebinding,role,rolebinding,sa -l k8s-app=cilium -A
 }
 
 k8s_uninstall_higress() {
@@ -2261,7 +2455,7 @@ k8s_install_higress() {
     local istio=$(getarg istio $@)
     local gateway=$(getarg gateway $@)
     local ingress_class=$(getarg ingress_class $@)
-    # local ingress_class=${ingress_class:-higress}
+    local ingress_class=${ingress_class:-higress}
 
     echo "local=${local}"
     echo "host=${host}"
@@ -2321,9 +2515,9 @@ k8s_install_higress() {
         # --set "higress-core.controller.nodeSelector.node-role\.kubernetes\.io\/control-plane=" \
         kubectl -n higress-system wait --for=condition=Ready pods --all
         kubectl get po -n higress-system
-    elif command -v sealos >/dev/null 2>&1; then
+    elif command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version higress)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/higress:${latest_version} \
@@ -2373,9 +2567,9 @@ k8s_install_higress_console() {
 
 k8s_install_ingress_nginx() {
     local host=$(getarg host $@)
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version ingress-nginx)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/ingress-nginx:${latest_version} \
@@ -2395,9 +2589,9 @@ k8s_install_ingress_nginx() {
 }
 
 k8s_install_kube_state_metrics() {
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version kube-state-metrics)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/kube-state-metrics:${latest_version}
@@ -2409,9 +2603,9 @@ k8s_install_kube_state_metrics() {
 }
 
 k8s_install_metrics_server() {
-    if command -v sealos >/dev/null 2>&1; then
+    if command -v sealos &>/dev/null 2>&1; then
         local cluster=$(getarg cluster $@)
-        local cluster==${cluster:-"$CLUSTER"}
+        local cluster=${cluster:-"$CLUSTER"}
         local latest_version=$(get_sealos_release_version metrics-server)
         sudo sealos run --cluster $cluster \
             -f ${labring_image_registry}/${labring_image_repository}/metrics-server:${latest_version}
@@ -2459,51 +2653,86 @@ k8s_install_core() {
 }
 
 # https://kubernetes.github.io/ingress-nginx/examples/auth/basic/
-k8s_install_ingress_rule() {
+k8s_install_route() {
     local name=$(getarg name $@)
     local namespace=$(getarg namespace $@)
     local ingress_class=$(getarg ingress_class $@)
     local service_name=$(getarg service_name $@)
     local service_port=$(getarg service_port $@)
     local auth_type=$(getarg auth_type $@)
-    local auth_seacret=$(getarg auth_secret $@)
+    local auth_secret=$(getarg auth_secret $@)
     local auth_realm=$(getarg auth_realm $@)
-    local domains=$(getarg domain $@)
-    local domains=${domains:-${name}.localhost}
-    local domains=$(echo ${domains[@]} | tr ',' ' ')
+    local routes=$(getarg routes $@)
+    local routes=${routes:-${name}.localhost}
+    local routes=$(echo ${routes[@]} | tr ',' ' ')
     local path_type=$(getarg path_type $@)
+    local tlsSecret=$(getarg tls_secret $@)
+    local sslRedirect=$(getarg ssl_redirect $@)
+    local gateway_mode=$(getarg gateway_mode $@)
+    local gateway_mode=${gateway_mode:-true}
 
-    NOTE ">>> install ingress domains: ${domains}"
-    idx=0
-    for domain in $domains; do
-        idx=$(expr $idx + 1)
+    NOTE ">>> install routing rules for routes: ${routes}"
+    local idx=0
+    for route in $routes; do
+        local domain=$(echo "$route" | awk -F. '{print $(NF-1)"."$NF}')
+        local idx=$(expr $idx + 1)
         echo "--------------------------------------------------------------------------"
-        echo "kubectl apply ingress: "
-        echo "                name = ${name}${idx} "
-        echo "           namespace = ${namespace} "
-        echo "              domain = ${domain} "
-        echo "       ingress_class = ${ingress_class} "
-        echo "        service_name = ${service_name} "
-        echo "        service_port = ${service_port} "
-        echo "           auth_type = ${auth_type} "
-        echo "         auth_secret = ${auth_secret} "
-        echo "          auth_realm = ${auth_realm} "
-        echo ""--------------------------------------------------------------------------""
-        echo "
+        echo "Creating route for: ${route} (gateway_mode=${gateway_mode})"
+
+        if [ "${gateway_mode}" == "true" ]; then
+            # ---------------------- Gateway API 模式 --------------------------
+            cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: ${name}${idx}
+  namespace: ${namespace:-default}
+spec:
+  parentRefs:
+  - name: ${ingress_class:-my-gateway}
+    namespace: ${namespace:-default}
+  hostnames:
+  - ${route}
+  rules:
+  - matches:
+    - path:
+        type: ${path_type:-PathPrefix}
+        value: /
+    backendRefs:
+    - name: ${service_name:-${name}}
+      port: ${service_port:-80}
+EOF
+
+        else
+            # ---------------------- Ingress 模式 --------------------------
+            local annotations=""
+            if [ -n "$tlsSecret" ]; then
+                annotations="nginx.ingress.kubernetes.io/backend-protocol: 'HTTP'
+    nginx.ingress.kubernetes.io/proxy-ssl-name: '${domain}'
+    nginx.ingress.kubernetes.io/proxy-ssl-server-name: 'true'
+    nginx.ingress.kubernetes.io/ssl-redirect: '${sslRedirect:-false}'"
+                local tls="tls:
+  - hosts:
+    - \"${route}\"
+    secretName: ${tlsSecret:-${domain}-crt}"
+            fi
+
+            cat <<EOF | kubectl apply -f -
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: ${name}${idx}
   namespace: ${namespace:-default}
   annotations:
-    kubernetes.io/ingress.class: ${ingress_class:-higress}
+    kubernetes.io/ingress.class: ${ingress_class:-nginx}
+    ${annotations}
     nginx.ingress.kubernetes.io/auth-type: ${auth_type}
     nginx.ingress.kubernetes.io/auth-secret: ${auth_secret}
-    nginx.ingress.kubernetes.io/auth-realm: '${auth_realm:-Authentication Required - ${domain}}'
+    nginx.ingress.kubernetes.io/auth-realm: '${auth_realm:-Authentication Required - ${route}}'
 spec:
-  ingressClassName: ${ingress_class:-higress}
+  ingressClassName: ${ingress_class:-nginx}
   rules:
-  - host: ${domain}
+  - host: ${route}
     http:
       paths:
       - path: "/"
@@ -2513,7 +2742,10 @@ spec:
             name: ${service_name:-${name}}
             port:
               number: ${service_port:-80}
-" | kubectl apply -f -
+  ${tls}
+EOF
+
+        fi
     done
 }
 
@@ -2677,39 +2909,61 @@ spec:
     local tcp_routes=$(getarg tcp_routes $@)
     local tcp_routes=${tcp_routes:-'frp-tcp.localhost'}
 
+    local tls_secret=$(getarg tls_secret $@)
+
+    local auth_type=$(getarg auth_type $@)
+    local auth_secret=$(getarg auth_secret $@)
+    local auth_realm=$(getarg auth_realm $@)
+
     local srv_name=$(kubectl get service -n ${namespace} | grep frps | awk '{print $1}')
 
-    k8s_install_ingress_rule \
+    k8s_install_route \
         --name frps-bind \
         --namespace ${namespace} \
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_bind \
-        --domain ${bind_routes}
+        --routes ${bind_routes} \
+        --tls_secret ${tls_secret} \
+        --auth_type ${auth_type} \
+        --auth_secret ${auth_secret} \
+        --auth_realm ${auth_realm}
 
-    k8s_install_ingress_rule \
+    k8s_install_route \
         --name frps-ui \
         --namespace ${namespace} \
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_ui \
-        --domain ${dashboard_routes}
+        --routes ${dashboard_routes} \
+        --tls_secret ${tls_secret} \
+        --auth_type ${auth_type} \
+        --auth_secret ${auth_secret} \
+        --auth_realm ${auth_realm}
 
-    k8s_install_ingress_rule \
+    k8s_install_route \
         --name frps-http \
         --namespace ${namespace} \
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_http \
-        --domain ${http_routes}
+        --routes ${http_routes} \
+        --tls_secret ${tls_secret} \
+        --auth_type ${auth_type} \
+        --auth_secret ${auth_secret} \
+        --auth_realm ${auth_realm}
 
-    k8s_install_ingress_rule \
+    k8s_install_route \
         --name frps-tcp \
         --namespace ${namespace} \
         --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_tcp \
-        --domain ${tcp_routes}
+        --routes ${tcp_routes} \
+        --tls_secret ${tls_secret} \
+        --auth_type ${auth_type} \
+        --auth_secret ${auth_secret} \
+        --auth_realm ${auth_realm}
 
     rm -rf ${tmpdir}
 
@@ -2723,12 +2977,17 @@ spec:
 # menu entry
 #
 ###################################################################################################
+
+if [ "$(hasarg debug $@)" == "true" ] || [ "$(hasarg x $@)" == "true" ]; then
+    set -x
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
     --init)
         init
         ;;
-    --set)
+    -set | --set)
         NOTE "================ set $2"
         eval "set_$2 $@"
         ;;
