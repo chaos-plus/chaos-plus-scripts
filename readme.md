@@ -121,10 +121,7 @@ bash chaosplus.sh -ki frps \
 --dashboard_routes "frps-ui.${DOMAIN}" \
 --http_routes "frp-http.${DOMAIN}" \
 --tcp_routes "frp-tcp.${DOMAIN}" \
---tls_secret "${DOMAIN}-crt" \
---auth_type "basic" \
---auth_secret "Pa44VV0rd14VVrOng" \
---auth_realm "Authentication Required - ${DOMAIN}"
+--tls_secret "${DOMAIN}-crt"
 
 ```
 
