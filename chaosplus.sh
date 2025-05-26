@@ -864,12 +864,17 @@ EOF
     # 使用 pm_install 统一安装所有工具包
     local packages=(
         curl wget git vim expect openssl iptables python3 qrencode tar zip unzip sed xxd
-        pwgen ntp ntpdate ntpstat jq sshpass neofetch irqbalance linux-cpupower systemd
+        pwgen ntp ntpdate ntpstat jq sshpass neofetch irqbalance linux-cpupower systemd rsyslog fail2ban
         snapd net-tools dnsutils cron apache2-utils bind-utils cronie httpd-tools inetutils
     )
     for package in "${packages[@]}"; do
         pm_install "$package" 2>/dev/null || true
     done
+
+    if command -v fail2ban &>/dev/null; then
+        sudo systemctl enable --now fail2ban
+        sudo systemctl start fail2ban
+    fi
 
     if command -v snapd &>/dev/null; then
         sudo systemctl enable --now snapd.socket
@@ -1591,7 +1596,6 @@ set_docker_mirrors() {
         echo '        "http://sealos.hub:5000"'
         echo '      ]'
         echo '    }'
-
         echo '  }'
         echo '}'
     } | sudo tee "$docker_config_path" >/dev/null
@@ -1936,6 +1940,8 @@ docker_install_crproxy() {
 ###################################################################################################
 
 k8s_install_acme() {
+    local namespace=$(getarg namespace $@)
+    local namespace=${namespace:-"default"}
     local domain=$(getarg domain $@)
     local domain=${domain:-"${DOMAIN}"}
     local solver=$(getarg solver $@)
@@ -1961,6 +1967,7 @@ k8s_install_acme() {
         fi
         kubectl apply -f ${GHPROXY}https://raw.githubusercontent.com/imroc/cert-manager-webhook-dnspod/master/bundle.yaml
 
+        # ClusterIssuer 会从 cert-manager 的 namespace 下找 Secret, 所以要创建在 cert-manager namespace 下不能改
         kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -1973,6 +1980,7 @@ stringData:
   secretKey: "${secretKey}"
 EOF
 
+        # ClusterIssuer 是集群级资源, 它不属于任何 namespace.
         kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -2005,10 +2013,10 @@ EOF
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: ${domain}-crt
-  namespace: cert-manager
+  name: wildcard-${domain}-tls
+  namespace: ${namespace}
 spec:
-  secretName: ${domain}-crt
+  secretName: wildcard-${domain}-tls
   issuerRef:
     name: dnspod-${domain}
     kind: ClusterIssuer
@@ -2019,9 +2027,9 @@ spec:
 EOF
 
     elif [ "$solver" == "ali" ] || [ "$solver" == "dns_ali" ]; then
-        echo "ali not support"
+        echo "ali not support" && exit 1
     elif [ "$solver" == "namesilo" ] || [ "$solver" == "dns_namesilo" ]; then
-        echo "namesilo not support"
+        echo "namesilo not support" && exit 1
     else
         ERROR "ENV solver: $solver is invalid, please use dnspod, ali, namesilo"
         exit 1
@@ -2030,11 +2038,17 @@ EOF
     # 重启cert-manager-webhook-dnspod
     kubectl delete pod -n cert-manager -l app=cert-manager-webhook-dnspod
 
-    # 查看证书状态
-    kubectl describe certificate ${domain}-crt
+    # kubectl wait --for=condition=Ready certificate/wildcard-${domain}-tls -n ${namespace} --timeout=120s || true
 
+    # 查看 ClusterIssuer 状态
+    kubectl describe clusterissuer dnspod-${domain}
+    # 查看证书状态
+    kubectl describe -n ${namespace} certificate wildcard-${domain}-tls
+    kubectl get certificaterequest -A
+    # 或直接查看具体请求
+    # kubectl describe certificaterequest wildcard-${domain}-tls-1 -n ${namespace}
     # 查看 cert-manager 日志
-    # kubectl logs -n cert-manager deploy/cert-manager
+    kubectl logs -n cert-manager deploy/cert-manager
 
 }
 
@@ -2119,11 +2133,19 @@ k8s_install_nodeport() {
     fi
 }
 
+k8s_uninstall_gateway_api() {
+    # https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports
+    local version=$(getarg version $@)
+    local version=${version:-"$(get_github_release_version "kubernetes-sigs/gateway-api")"}
+    kubectl delete -f ${GHPROXY}https://github.com/kubernetes-sigs/gateway-api/releases/download/${version}/experimental-install.yaml
+}
+
 k8s_install_gateway_api() {
+    local version=$(getarg version $@)
+    local version=${version:-"$(get_github_release_version "kubernetes-sigs/gateway-api")"}
     # Gateway API CRD
-    # kubectl apply -f ${GHPROXY}https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
-    local VERSION=$(get_github_release_version "kubernetes-sigs/gateway-api")
-    kubectl apply -f ${GHPROXY}https://github.com/kubernetes-sigs/gateway-api/releases/download/${VERSION}/experimental-install.yaml
+    # kubectl apply -f ${GHPROXY}https://github.com/kubernetes-sigs/gateway-api/releases/download/${version}/standard-install.yaml
+    kubectl apply -f ${GHPROXY}https://github.com/kubernetes-sigs/gateway-api/releases/download/${version}/experimental-install.yaml
 }
 
 k8s_install_longhorn() {
@@ -2281,9 +2303,13 @@ k8s_install_cilium() {
 
     local ingress=$(getarg ingress $@)
     local ingress=${ingress:-"false"}
+    local ingressHost=$(getarg ingress_host $@)
+    local ingressHost=${ingressHost:-"false"}
 
     local gatewayAPI=$(getarg gateway_api $@)
-    local gatewayAPI=${gatewayAPI:-"true"}
+    local gatewayAPI=${gatewayAPI:-"false"}
+    local gatewayHost=$(getarg gateway_host $@)
+    local gatewayHost=${gatewayHost:-"false"}
 
     local envoy=$(getarg envoy $@)
     local envoy=${envoy:-"true"}
@@ -2304,62 +2330,117 @@ k8s_install_cilium() {
         kubectl -n kube-system delete cm kube-proxy 2>/dev/null || true
     fi
 
+    # https://docs.cilium.io/en/stable/helm-reference/
     local ExtraValues=","
     if [ -n "${ipam}" ]; then
+        NOTE "Cilium ipam mode => ${ipam}"
         local ExtraValues=$ExtraValues",ipam.mode=${ipam}"
     fi
     if [ -n "${kubeProxyReplacement}" ]; then
+        NOTE "Cilium kubeProxyReplacement => ${kubeProxyReplacement}"
         local ExtraValues=$ExtraValues",kubeProxyReplacement=${kubeProxyReplacement}"
         local ExtraValues=$ExtraValues",nodePort.enabled=true"
     fi
-    local ExtraValues=$ExtraValues",global.nodeinit.enabled=true"
-    local ExtraValues=$ExtraValues",ipam.Operator.ClusterPoolIPv4MaskSize=24"
-    local ExtraValues=$ExtraValues",ipam.operator.clusterPoolIPv4PodCIDRList=10.42.0.0/16"
-    local ExtraValues=$ExtraValues",ipv4NativeRoutingCIDR=10.42.0.0/16"
-    local ExtraValues=$ExtraValues",routingMode=native"
-    local ExtraValues=$ExtraValues",autoDirectNodeRoutes=true"
-    local ExtraValues=$ExtraValues",tunnel=diabled"
-    local ExtraValues=$ExtraValues",bpf.masquerade=true"
-    local ExtraValues=$ExtraValues",bpf.hostLegacyRouting=true"
-    local ExtraValues=$ExtraValues",loadBalancer.mode=hybrid"
+    # local ExtraValues=$ExtraValues",global.nodeinit.enabled=true"
+    # local ExtraValues=$ExtraValues",global.nodeinit.securityContext.privileged=true"
+    # local ExtraValues=$ExtraValues",ipam.Operator.ClusterPoolIPv4MaskSize=24"
+    # local ExtraValues=$ExtraValues",ipam.operator.clusterPoolIPv4PodCIDRList=10.42.0.0/16"
+    # local ExtraValues=$ExtraValues",ipv4NativeRoutingCIDR=10.42.0.0/16"
+    # local ExtraValues=$ExtraValues",routingMode=native"
+    # local ExtraValues=$ExtraValues",autoDirectNodeRoutes=true"
+    # local ExtraValues=$ExtraValues",tunnel=diabled" // tunnel was deprecated in v1.14 and has been removed in v1.15
+    # local ExtraValues=$ExtraValues",bpf.masquerade=true"
+    # local ExtraValues=$ExtraValues",bpf.hostLegacyRouting=true"
+    # local ExtraValues=$ExtraValues",loadBalancer.mode=hybrid"
     if [ "${gatewayAPI}" = "true" ]; then
+        NOTE "Cilium Gateway API enabled"
         local ExtraValues=$ExtraValues",gatewayAPI.enabled=true"
-        local ExtraValues=$ExtraValues",gatewayAPI.hostNetwork.enabled=true"
+
+        if [ "${gatewayHost}" = "true" ]; then
+            # Enabling the Cilium Gateway API host network mode automatically disables the LoadBalancer type Service mode.
+            # They are mutually exclusive.
+            # The listener is exposed on all interfaces ( for IPv4 and/or for IPv6).
+            NOTE "Cilium Gateway API host enabled"
+            local ExtraValues=$ExtraValues",gatewayAPI.hostNetwork.enabled=true"
+            # local ExtraValues=$ExtraValues",gatewayAPI.externalTrafficPolicy=~"
+        fi
     fi
     if [ "${ingress}" = "true" ]; then
+        NOTE "Cilium Ingress enabled"
         local ExtraValues=$ExtraValues",ingressController.enabled=${ingress}"
         local ExtraValues=$ExtraValues",ingressController.loadbalancerMode=shared"
+
+        if [ "${ingressHost}" = "true" ]; then
+            NOTE "Cilium Ingress host enabled"
+            local ExtraValues=$ExtraValues",ingressController.hostNetwork.enabled=${ingressHost}"
+            local ExtraValues=$ExtraValues",ingressController.service.externalTrafficPolicy=~"
+        else
+            local ExtraValues=$ExtraValues",ingressController.service.type=LoadBalancer"
+            local ExtraValues=$ExtraValues",ingressController.service.insecureNodePort=80"
+            local ExtraValues=$ExtraValues",ingressController.service.secureNodePort=443"
+        fi
     fi
     if [ "${envoy}" = "true" ]; then
         local ExtraValues=$ExtraValues",envoy.enabled=true"
+        local ExtraValues=$ExtraValues",securityContext.privileged=true"
+        local ExtraValues=$ExtraValues",envoy.securityContext.privileged=true"
+
         local ExtraValues=$ExtraValues",envoy.securityContext.keepCapNetBindService=true"
         local ExtraValues=$ExtraValues",envoy.securityContext.envoy[0]=NET_BIND_SERVICE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[1]=NET_ADMIN"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[2]=IPC_LOCK"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[3]=SYS_MODULE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[4]=SYS_ADMIN"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[5]=SYS_RESOURCE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[6]=DAC_OVERRIDE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[7]=FOWNER"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[8]=SETGID"
+        local ExtraValues=$ExtraValues",envoy.securityContext.envoy[9]=SETUID"
+
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.keepCapNetBindService=true"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[0]=NET_BIND_SERVICE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[1]=NET_ADMIN"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[2]=IPC_LOCK"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[3]=SYS_MODULE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[4]=SYS_ADMIN"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[5]=SYS_RESOURCE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[6]=DAC_OVERRIDE"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[7]=FOWNER"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[8]=SETGID"
+        local ExtraValues=$ExtraValues",envoy.securityContext.capabilities.envoy[9]=SETUID"
+
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[0]=NET_BIND_SERVICE"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[1]=NET_ADMIN"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[2]=IPC_LOCK"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[3]=SYS_MODULE"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[4]=SYS_ADMIN"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[5]=SYS_RESOURCE"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[6]=DAC_OVERRIDE"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[7]=FOWNER"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[8]=SETGID"
+        local ExtraValues=$ExtraValues",securityContext.capabilities.ciliumAgent[9]=SETUID"
+
+        # local ExtraValues=$ExtraValues",loadBalancer.l7.backend=envoy"
     fi
     local ExtraValues="$(echo "$ExtraValues" | sed -E 's/,+/,/g')"
 
-    if command -v sealos &>/dev/null; then
-        if ! command -v cilium &>/dev/null; then
-            echo "cilium not installed, try to install with sealos"
-            local cluster=$(getarg cluster $@)
-            local cluster=${cluster:-"$CLUSTER"}
+    # if command -v sealos &>/dev/null; then
+    #     if ! command -v cilium &>/dev/null; then
+    #         echo "cilium not installed, try to install with sealos"
+    #         local cluster=$(getarg cluster $@)
+    #         local cluster=${cluster:-"$CLUSTER"}
 
-            ip link delete flannel.1 2>/dev/null || true
-            ip link delete cni0 2>/dev/null || true
-            ip link delete cilium_vxlan 2>/dev/null || true
+    #         # ip link delete flannel.1 2>/dev/null || true
+    #         # ip link delete cni0 2>/dev/null || true
+    #         # ip link delete cilium_vxlan 2>/dev/null || true
 
-            # https://github.com/labring-actions/cluster-image/blob/main/applications/cilium
-            sudo sealos run --cluster $cluster \
-                -f ${labring_image_registry}/${labring_image_repository}/cilium:v${cilium_version} \
-                --env ExtraValues="$ExtraValues"
-        fi
-    fi
-
-    if ! command -v cilium &>/dev/null; then
-        if command -v mickrok8s &>/dev/null; then
-            echo "cilium not installed, try to install with microk8s"
-            sudo microk8s enable cilium
-        fi
-    fi
+    #         NOTE "Cilium ExtraValues => ${ExtraValues}"
+    #         # https://github.com/labring-actions/cluster-image/blob/main/applications/cilium
+    #         sudo sealos run --cluster $cluster \
+    #             -f ${labring_image_registry}/${labring_image_repository}/cilium:v${cilium_version} \
+    #             --env ExtraValues="$ExtraValues"
+    #     fi
+    # fi
 
     if ! command -v cilium &>/dev/null; then
         echo "cilium not installed, try to install with cilium cli"
@@ -2428,12 +2509,17 @@ k8s_install_cilium() {
     }
     wait_for_cilium
 
+    # cilium version
+
+    if [ "${gatewayAPI}" = "true" ]; then
+        cilium config view | grep -w "enable-gateway-api"
+        kubectl get gatewayclass cilium
+    fi
+
 }
 
 k8s_uninstall_cilium() {
-    if command -v cilium &>/dev/null; then
-        cilium uninstall
-    fi
+    cilium uninstall 2>/dev/null || true
     for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
         if kubectl describe node "$node" | grep -q 'node.cilium.io/agent-not-ready:NoSchedule'; then
             kubectl taint nodes "$node" node.cilium.io/agent-not-ready:NoSchedule-
@@ -2652,11 +2738,108 @@ k8s_install_core() {
 
 }
 
+k8s_install_namespace() {
+    local namespace=$(getarg namespace $@)
+    if [ -z "${namespace}" ]; then
+        ERROR "namespace is required"
+        return 1
+    fi
+    kubectl create namespace ${namespace}
+}
+
+k8s_install_gateway() {
+    local domain=$(getarg domain $@)
+    local name=$(getarg name $@)
+    local name=$(echo ${name} | tr '.' '-')
+    local name=${name:-wildcard-$(echo ${domain} | tr '.' '-')-gateway}
+    local namespace=$(getarg namespace $@)
+
+    if [ -z "${domain}" ]; then
+        ERROR "domain is required"
+        return 1
+    fi
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${name}
+  namespace: ${namespace:-default}
+spec:
+  gatewayClassName: cilium
+  listeners:
+  - name: http-root-${domain}
+    port: 80
+    protocol: HTTP
+    hostname: "${domain}"
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: http-wildcard-${domain}
+    port: 80
+    protocol: HTTP
+    hostname: "*.${domain}"
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: https-root-${domain}
+    port: 443
+    protocol: HTTPS
+    hostname: "${domain}"
+    tls:
+      certificateRefs:
+      - kind: Secret
+        name: wildcard-${domain}-tls
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: https-wildcard-${domain}
+    port: 443
+    protocol: HTTPS
+    hostname: "*.${domain}"
+    tls:
+      certificateRefs:
+      - kind: Secret
+        name: wildcard-${domain}-tls
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ${name}-redirect-to-https
+  namespace: ${namespace:-default}
+spec:
+  parentRefs:
+    - name: ${name}
+      namespace: ${namespace:-default}
+      sectionName: http-root-${domain}
+  hostnames:
+    - "${domain}"
+    - "*.${domain}"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            port: 443
+            statusCode: 302
+
+EOF
+
+}
+
 # https://kubernetes.github.io/ingress-nginx/examples/auth/basic/
 k8s_install_route() {
     local name=$(getarg name $@)
     local namespace=$(getarg namespace $@)
-    local ingress_class=$(getarg ingress_class $@)
     local service_name=$(getarg service_name $@)
     local service_port=$(getarg service_port $@)
     local auth_type=$(getarg auth_type $@)
@@ -2668,8 +2851,24 @@ k8s_install_route() {
     local path_type=$(getarg path_type $@)
     local tlsSecret=$(getarg tls_secret $@)
     local sslRedirect=$(getarg ssl_redirect $@)
+
+    local ingress_mode=$(getarg ingress_mode $@)
+    local ingress_class=$(getarg ingress_class $@)
+    local ingress_classes=$(kubectl get ingressclasses -o jsonpath='{.items[*].metadata.name}')
+    if [ "$ingress_mode" == "" ] && [ -n "$ingress_classes" ]; then
+        local ingress_mode="true"
+    fi
+    if [ "$ingress_mode" == "true" ] && [ "$ingress_class" == "" ] && [ -n "$ingress_classes" ]; then
+        local ingress_class=$(echo "$ingress_classes" | awk '{print $1}')
+    fi
+
+    # https://github.com/kubernetes-sigs/gateway-api/blob/master/examples/gatewayclass.yaml
+    local gateway=$(getarg gateway $@)
     local gateway_mode=$(getarg gateway_mode $@)
-    local gateway_mode=${gateway_mode:-true}
+    local gateway_classes=$(kubectl get gatewayclasses.gateway.networking.k8s.io -A --no-headers | awk '{print $1 " " $2}')
+    if [ "$gateway_mode" == "" ] && [ -n "${gateway_classes}" ]; then
+        local gateway_mode="true"
+    fi
 
     NOTE ">>> install routing rules for routes: ${routes}"
     local idx=0
@@ -2678,18 +2877,17 @@ k8s_install_route() {
         local idx=$(expr $idx + 1)
         echo "--------------------------------------------------------------------------"
         echo "Creating route for: ${route} (gateway_mode=${gateway_mode})"
-
         if [ "${gateway_mode}" == "true" ]; then
             # ---------------------- Gateway API 模式 --------------------------
             cat <<EOF | kubectl apply -f -
-apiVersion: gateway.networking.k8s.io/v1beta1
+apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: ${name}${idx}
   namespace: ${namespace:-default}
 spec:
   parentRefs:
-  - name: ${ingress_class:-my-gateway}
+  - name: ${gateway:-wildcard-$(echo ${domain} | tr '.' '-')-gateway}
     namespace: ${namespace:-default}
   hostnames:
   - ${route}
@@ -2703,8 +2901,9 @@ spec:
       port: ${service_port:-80}
 EOF
 
-        else
+        elif [ "${ingress_mode}" == "true" ]; then
             # ---------------------- Ingress 模式 --------------------------
+
             local annotations=""
             if [ -n "$tlsSecret" ]; then
                 annotations="nginx.ingress.kubernetes.io/backend-protocol: 'HTTP'
@@ -2714,7 +2913,7 @@ EOF
                 local tls="tls:
   - hosts:
     - \"${route}\"
-    secretName: ${tlsSecret:-${domain}-crt}"
+    secretName: ${tlsSecret:-wildcard-${domain}-tls}"
             fi
 
             cat <<EOF | kubectl apply -f -
@@ -2769,7 +2968,9 @@ k8s_install_frps() {
     local storage_class=${storage_class:-""}
 
     local ingress_class=$(getarg ingress_class $@ 2>/dev/null)
-    local ingress_class=${ingress_class:-higress}
+
+    local service_type=$(getarg service_type $@ 2>/dev/null)
+    local service_type=${service_type:-NodePort}
 
     local image=$(getarg image $@ 2>/dev/null)
     local image=${image:-docker.io/snowdreamtech/frps}
@@ -2871,7 +3072,7 @@ metadata:
   name: frps
   namespace: ${namespace:-default}
 spec:
-  type: NodePort
+  type: ${service_type}
   ports:
     - protocol: TCP
       name: bind
