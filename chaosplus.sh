@@ -2842,9 +2842,7 @@ k8s_install_route() {
     local namespace=$(getarg namespace $@)
     local service_name=$(getarg service_name $@)
     local service_port=$(getarg service_port $@)
-    local auth_type=$(getarg auth_type $@)
-    local auth_secret=$(getarg auth_secret $@)
-    local auth_realm=$(getarg auth_realm $@)
+
     local routes=$(getarg routes $@)
     local routes=${routes:-${name}.localhost}
     local routes=$(echo ${routes[@]} | tr ',' ' ')
@@ -2925,9 +2923,6 @@ metadata:
   annotations:
     kubernetes.io/ingress.class: ${ingress_class:-nginx}
     ${annotations}
-    nginx.ingress.kubernetes.io/auth-type: ${auth_type}
-    nginx.ingress.kubernetes.io/auth-secret: ${auth_secret}
-    nginx.ingress.kubernetes.io/auth-realm: '${auth_realm:-Authentication Required - ${route}}'
 spec:
   ingressClassName: ${ingress_class:-nginx}
   rules:
@@ -3112,10 +3107,6 @@ spec:
 
     local tls_secret=$(getarg tls_secret $@)
 
-    local auth_type=$(getarg auth_type $@)
-    local auth_secret=$(getarg auth_secret $@)
-    local auth_realm=$(getarg auth_realm $@)
-
     local srv_name=$(kubectl get service -n ${namespace} | grep frps | awk '{print $1}')
 
     k8s_install_route \
@@ -3125,10 +3116,7 @@ spec:
         --service_name $srv_name \
         --service_port $port_bind \
         --routes ${bind_routes} \
-        --tls_secret ${tls_secret} \
-        --auth_type ${auth_type} \
-        --auth_secret ${auth_secret} \
-        --auth_realm ${auth_realm}
+        --tls_secret ${tls_secret}
 
     k8s_install_route \
         --name frps-ui \
@@ -3137,10 +3125,7 @@ spec:
         --service_name $srv_name \
         --service_port $port_ui \
         --routes ${dashboard_routes} \
-        --tls_secret ${tls_secret} \
-        --auth_type ${auth_type} \
-        --auth_secret ${auth_secret} \
-        --auth_realm ${auth_realm}
+        --tls_secret ${tls_secret}
 
     k8s_install_route \
         --name frps-http \
@@ -3149,10 +3134,7 @@ spec:
         --service_name $srv_name \
         --service_port $port_http \
         --routes ${http_routes} \
-        --tls_secret ${tls_secret} \
-        --auth_type ${auth_type} \
-        --auth_secret ${auth_secret} \
-        --auth_realm ${auth_realm}
+        --tls_secret ${tls_secret}
 
     k8s_install_route \
         --name frps-tcp \
@@ -3161,10 +3143,7 @@ spec:
         --service_name $srv_name \
         --service_port $port_tcp \
         --routes ${tcp_routes} \
-        --tls_secret ${tls_secret} \
-        --auth_type ${auth_type} \
-        --auth_secret ${auth_secret} \
-        --auth_realm ${auth_realm}
+        --tls_secret ${tls_secret}
 
     rm -rf ${tmpdir}
 
