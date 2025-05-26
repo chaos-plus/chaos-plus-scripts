@@ -7,69 +7,132 @@
 > [https://github.com/chaos-plus/chaos-plus-proxy-scripts](https://github.com/chaos-plus/chaos-plus-proxy-scripts)
 
 
-## Install K8S
+## Install K&S
 
 ```bash
 
+if [ ! -n "$IPV4_WAN" ]; then
+   export IPV4_WAN=$(curl -sfL ifconfig.me --silent --connect-timeout 5 --max-time 5)
+fi
+if [ ! -n "$IPV4_WAN" ]; then
+   export IPV4_WAN=$(curl -sfL 4.ipw.cn --silent --connect-timeout 5 --max-time 5)
+fi
+if [ ! -n "$IPV4_WAN" ]; then
+   export IPV4_WAN=$(curl -sfL https://api.ipify.org?format=text --silent --connect-timeout 5 --max-time 5)
+fi
+
+IPV4_LAN=$(ip -4 addr show |
+    grep -v '127.0.0.1' |
+    grep -v 'docker' |
+    grep -v 'veth' |
+    grep -v 'br-' |
+    grep -v 'tun' |
+    grep -v 'tap' |
+    grep -v 'docker0' |
+    grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' |
+    head -n 1)
+
 export CRPROXY=noproxy.top
 export GHPROXY=https://gh.noproxy.top/
-export DOMAIN=<Your_Domain>
-export REPO=${GHPROXY}https://raw.githubusercontent.com/chaos-plus/chaos-plus-scripts/refs/heads/main/
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) --set linux_mirrors_auto
+export DOMAIN="example.com"
+export ACME_DNS="dnspod"
+export ACME_DNS_ID="your tencent ram id"
+export ACME_DNS_KEY="your tencent ram key"
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) --init
+export SSHPWD="ssh password"
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -si k8s_auto \
---cri k3s \
---k8s_version v1.29.9 \
---masters <Your_HOST_IP> \
---sshpwd <Your_SSH_Password>
+echo "--------------------------------------------------"
+echo "ENV IPV4_WAN: ${IPV4_WAN}"
+echo "ENV IPV4_LAN: ${IPV4_LAN}"
+echo "ENV CRPROXY: ${CRPROXY}"
+echo "ENV GHPROXY: ${GHPROXY}"
+echo "ENV DOMAIN: ${DOMAIN}"
+echo "ENV ACME_DNS: ${ACME_DNS}"
+echo "ENV ACME_DNS_ID: ${ACME_DNS_ID}"
+echo "ENV ACME_DNS_KEY: ${ACME_DNS_KEY}"
+echo "--------------------------------------------------"
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -si k8s_config
+bash chaosplus.sh --set linux_mirrors_auto
 
-# bash <(curl -Ls ${REPO}/chaosplus.sh) --set cr_mirrors_host \
-# --mirrors ${CRPROXY}
-bash <(curl -Ls ${REPO}/chaosplus.sh) -si k8s_cr_mirrors_registries \
+bash chaosplus.sh --init
+
+mkdir -p /etc/containerd/certs.d
+bash chaosplus.sh \
+-set cr_mirrors_auto \
+--schema https \
 --mirrors ${CRPROXY}
 
-#bash <(curl -Ls ${REPO}/chaosplus.sh) -ki core --cidr <Your_Public_IPS>
+# 1.28.11  1.29.9  1.30.5
+bash chaosplus.sh -si k8s_auto \
+--cri containerd \
+--k8s_version v1.30.5 \
+--masters ${IPV4_LAN} \
+--external_ips ${IPV4_WAN} \
+--sshpwd ${SSHPWD}
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki helm
+# bash chaosplus.sh -si k8s_config
 
-bash<(curl -Ls ${REPO}/chaosplus.sh) -ki cilium
-# bash chaosplus.sh -ki cilium --upgrade
-# bash chaosplus.sh -ki cilium_cidr
-# --cidr xx.xx.xx.xx,xx.xx.xx.xx
+bash chaosplus.sh \
+-ki nodeport \
+--range 80-60000
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki istio
+bash chaosplus.sh -ki helm
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki cert_manager
+# 1.0.0 1.1.0 1.1.1 1.2.0 1.2.1 1.3.0
+# 高版本会导致cilium gateway api 无法工作
+# bash chaosplus.sh -kr gateway_api --version v1.2.0
+bash chaosplus.sh -ki gateway_api --version v1.2.0
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki metrics_server
+# 1.16.1 1.17.0 1.17.4
+# bash chaosplus.sh -kr cilium
+bash chaosplus.sh -ki cilium --cilium_version 1.17.0 \
+--gateway_api true \
+--gateway_host true
+# bash chaosplus.sh -ki cilium --upgrade --cilium_version 1.17.0
+# 配置 Gateway 时，Cilium 会创建一个类型为 LoadBalancer 的 Service, 需要配置cidr, 否则 gateway 会 programed unknown
+# bash chaosplus.sh -ki cilium_cidr --cidr ${IPV4_WAN}
 
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki openebs
+# bash chaosplus.sh -ki istio
 
-# higress 2 好像不支持 gatewayAPI, 使用 Host+NodePort
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki higress \
---gateway false \
---istio true \
---host true \
---type NodePort
+bash chaosplus.sh -ki cert_manager
 
-# install frps
-bash <(curl -Ls ${REPO}/chaosplus.sh) -ki frps \
---bind_routes frps.${DOMAIN} \
---dashboard_routes frps-ui.${DOMAIN} \
---http_routes frp-http.${DOMAIN},frp-xx.${DOMAIN} \
---tcp_routes frp-tcp.${DOMAIN}
+bash chaosplus.sh -ki metrics_server
+
+bash chaosplus.sh -ki openebs
+
+bash chaosplus.sh -ki namespace \
+--namespace cloud
+
+bash chaosplus.sh -ki acme \
+--namespace cloud \
+--domain ${DOMAIN} \
+--solver ${ACME_DNS} \
+--secret_id ${ACME_DNS_ID} \
+--secret_key ${ACME_DNS_KEY}
+
+bash chaosplus.sh -ki gateway \
+--namespace cloud \
+--domain ${DOMAIN}
+
+bash chaosplus.sh -ki frps \
+--namespace cloud \
+--bind_routes "frps.${DOMAIN}" \
+--dashboard_routes "frps-ui.${DOMAIN}" \
+--http_routes "frp-http.${DOMAIN}" \
+--tcp_routes "frp-tcp.${DOMAIN}" \
+--tls_secret "${DOMAIN}-crt" \
+--auth_type "basic" \
+--auth_secret "Pa44VV0rd14VVrOng" \
+--auth_realm "Authentication Required - ${DOMAIN}"
 
 ```
 
 ## Uninstall K8S
 
 ```bash
-bash <(curl -Ls ${REPO}/chaosplus.sh) -sr k8s_auto \
---sshpwd <Your_SSH_Password>
-bash chaosplus.sh -sr cri
+bash chaosplus.sh \
+-sr k8s_auto \
+-sr cri \
+--sshpwd ${SSHPWD}
 ```
