@@ -6,6 +6,7 @@ set -e
 #
 ###################################################################################################
 
+
 LANG=en_US.UTF-8
 
 RED='\033[0;31m'
@@ -33,6 +34,7 @@ NOTE() { echo -e "${NOTE} ${1}"; }
 INFO() { echo -e "${INFO} ${1}"; }
 WARN() { echo -e "${WARN} ${1}"; }
 ERROR() { echo -e "${ERROR} ${1}"; }
+
 
 PM() {
     if command -v apt &>/dev/null; then
@@ -220,160 +222,63 @@ pm_uninstall_one() {
 
     # 判断系统并选择合适的包管理器进行卸载
     if command -v apt &>/dev/null; then
-        # 使用 apt
-        if dpkg-query -l "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using apt."
-            sudo apt remove -y "$package_name"
-            sudo apt autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in apt repository."
-        fi
-    fi
-
-    if command -v apt-get &>/dev/null; then
+        sudo apt remove --purge -y "$package_name" || true
+    elif command -v apt-get &>/dev/null; then
         # 使用 apt-get
-        if dpkg-query -l "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using apt-get."
-            sudo apt-get remove -y "$package_name"
-            sudo apt-get autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in apt-get repository."
-        fi
-    fi
-
-    if command -v yum &>/dev/null; then
+        sudo apt-get remove --purge -y "$package_name" || true
+    elif command -v yum &>/dev/null; then
         # 使用 yum
-        if yum list installed "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using yum."
-            sudo yum remove -y "$package_name"
-            sudo yum autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in yum repository."
-        fi
-    fi
-
-    if command -v pacman &>/dev/null; then
+        sudo yum remove -y "$package_name" || true
+    elif command -v pacman &>/dev/null; then
         # 使用 pacman
-        if pacman -Qs "$package_name" | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using pacman."
-            sudo pacman -R --noconfirm "$package_name"
-            sudo pacman -R $(pacman -Qdtq)
-            return
-        else
-            echo "Package '$package_name' not found in pacman repository."
-        fi
+        sudo pacman -R --noconfirm "$package_name" || true
     fi
 
     if command -v dnf &>/dev/null; then
         # 使用 dnf
-        if dnf list installed "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using dnf."
-            sudo dnf remove -y "$package_name"
-            sudo dnf autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in dnf repository."
-        fi
+        sudo dnf remove -y "$package_name" || true
     fi
 
     if command -v snap &>/dev/null; then
         # 使用 snap
-        if snap list "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using snap."
-            sudo snap remove "$package_name" --purge
-            return
-        else
-            echo "Package '$package_name' not found in snap repository."
-        fi
+        sudo snap remove "$package_name" --purge || true
     fi
 
     if command -v yay &>/dev/null; then
         # 使用 yay
-        if yay -Qs "$package_name" | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using yay."
-            yay -R --noconfirm "$package_name"
-            yay -R $(yay -Qdtq)
-            return
-        else
-            echo "Package '$package_name' not found in yay repository."
-        fi
+        sudo yay -R --noconfirm "$package_name" || true
     fi
 
     if command -v zypper &>/dev/null; then
         # 使用 zypper
-        if zypper search --installed-only "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using zypper."
-            sudo zypper remove -y "$package_name"
-            sudo zypper autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in zypper repository."
-        fi
+        sudo zypper remove -y "$package_name" || true
     fi
 
     if command -v brew &>/dev/null; then
         # 使用 brew
-        if brew list "$package_name" &>/dev/null; then
-            echo "Uninstalling $package_name using brew."
-            brew uninstall "$package_name"
-            brew cleanup --prune=all
-            return
-        else
-            echo "Package '$package_name' not found in brew repository."
-        fi
+        sudo brew uninstall "$package_name" || true
     fi
 
     if command -v flatpak &>/dev/null; then
         # 使用 flatpak
-        if flatpak list | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using flatpak."
-            sudo flatpak uninstall -y "$package_name"
-            return
-        else
-            echo "Package '$package_name' not found in flatpak repository."
-        fi
+        sudo flatpak uninstall "$package_name" || true
     fi
 
     if command -v port &>/dev/null; then
         # 使用 port
-        if port installed | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using port."
-            sudo port uninstall "$package_name"
-            sudo port autoremove -y
-            return
-        else
-            echo "Package '$package_name' not found in port repository."
-        fi
+        sudo port uninstall "$package_name" || true
     fi
 
     if command -v conda &>/dev/null; then
         # 使用 conda
-        if conda list | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using conda."
-            conda remove -y "$package_name"
-            conda clean -y
-            return
-        else
-            echo "Package '$package_name' not found in conda repository."
-        fi
+        sudo conda remove "$package_name" || true
     fi
 
     if command -v nix &>/dev/null; then
         # 使用 nix
-        if nix-env -q | grep -q "$package_name"; then
-            echo "Uninstalling $package_name using nix."
-            nix-env -e "$package_name"
-            nix-env --delete-generations old
-            return
-        else
-            echo "Package '$package_name' not found in nix repository."
-        fi
+        sudo nix-env -e "$package_name" || true
     fi
 
-    echo "Package manager not supported on this system."
 }
 
 pm_install() {
@@ -808,16 +713,37 @@ init() {
     echo never >/sys/kernel/mm/transparent_hugepage/defrag
     cat /sys/kernel/mm/transparent_hugepage/enabled
 
-    # 设置 sysctl 参数
-    local SYSCTL_CONF="/etc/sysctl.conf"
-    if ! grep -q 'vm.swappiness = 0' "$SYSCTL_CONF"; then
-        echo "fs.file-max = 1000000" >>"$SYSCTL_CONF"
-        echo "net.core.somaxconn = 32768" >>"$SYSCTL_CONF"
-        echo "net.ipv4.tcp_tw_recycle = 0" >>"$SYSCTL_CONF"
-        echo "net.ipv4.tcp_syncookies = 0" >>"$SYSCTL_CONF"
-        echo "vm.overcommit_memory = 1" >>"$SYSCTL_CONF"
-        sysctl -p
+
+    SYSCTL_CONF="/etc/sysctl.conf"
+
+    add_sysctl_param() {
+        local param="$1"
+        local value="$2"
+        if ! grep -q "^${param} *= *" "$SYSCTL_CONF"; then
+            echo "${param} = ${value}" >> "$SYSCTL_CONF"
+        fi
+    }
+
+    # 添加常规参数（逐个判断）
+    add_sysctl_param "fs.file-max" 1000000
+    add_sysctl_param "net.core.somaxconn" 32768
+    add_sysctl_param "net.ipv4.tcp_syncookies" 0
+    add_sysctl_param "vm.overcommit_memory" 1
+    add_sysctl_param "vm.swappiness" 0
+
+    # 获取主版本+次版本号（如 4.15）
+    kernel_version=$(uname -r | cut -d'-' -f1 | cut -d'.' -f1-2)
+
+    # 判断是否支持 net.ipv4.tcp_tw_recycle（< 4.12 的老内核才支持）
+    if [[ $(echo "$kernel_version < 4.12" | bc -l) -eq 1 ]]; then
+        # 检查内核是否支持该参数
+        if sysctl -a 2>/dev/null | grep -q "net.ipv4.tcp_tw_recycle"; then
+            add_sysctl_param "net.ipv4.tcp_tw_recycle" 0
+        fi
     fi
+
+    # 应用配置
+    sysctl -p || true
 
     # 设置文件描述符限制
     if ! grep -q 'root.*nofile.*1000000' /etc/security/limits.conf; then
@@ -1166,33 +1092,35 @@ system_uninstall_cri() {
 
     # 清理所有容器、镜像、卷
     if command -v docker &>/dev/null; then
-        docker rm -f $(docker ps -aq)
-        docker system prune -a -f
-        docker volume prune -f
+        docker rm -f $(docker ps -aq) || true
+        docker rmi -f $(docker images -q) || true
+        docker volume rm -f $(docker volume ls -q) || true
+        docker system prune -a -f || true
+        docker volume prune -f || true
     fi
 
-    if command -v containerd &>/dev/null; then
-        containerd rm -f $(containerd ps -q)
-        containerd rmi -f $(containerd images)
-        containerd volume rm -f $(containerd volume ls -q)
-    fi
+    # if command -v containerd &>/dev/null; then
+    #     containerd rm -f $(containerd ps -q)
+    #     containerd rmi -f $(containerd images)
+    #     containerd volume rm -f $(containerd volume ls -q)
+    # fi
 
     if command -v crictl &>/dev/null; then
-        crictl rm -f $(crictl ps -a -q)
-        crictl rmi -f $(crictl images)
-        crictl volume rm -f $(crictl volume ls -q)
+        crictl rm -f $(crictl ps -a -q) || true
+        crictl rmi -f $(crictl images) || true
+        crictl volume rm -f $(crictl volume ls -q) || true
     fi
 
     if command -v ctr &>/dev/null; then
-        ctr rm -f $(ctr ps -a -q)
-        ctr rmi -f $(ctr images)
-        ctr volume rm -f $(ctr volume ls -q)
+        ctr rm -f $(ctr ps -a -q) || true
+        ctr rmi -f $(ctr images) || true
+        ctr volume rm -f $(ctr volume ls -q) || true
     fi
 
     if command -v podman &>/dev/null; then
-        podman rm -f $(podman ps -aq)
-        podman rmi -f $(podman images)
-        podman volume rm -f $(podman volume ls -q)
+        podman rm -f $(podman ps -aq) || true
+        podman rmi -f $(podman images) || true
+        podman volume rm -f $(podman volume ls -q) || true
     fi
 
     if command -v microk8s &>/dev/null; then
@@ -1241,7 +1169,7 @@ system_uninstall_cri() {
     sudo systemctl stop containerd 2>/dev/null || true
     sudo systemctl disable containerd 2>/dev/null || true
 
-    pm_uninstall docker docker-ce docker-engine docker.io containerd runc
+    pm_uninstall docker docker-ce docker-ce-cli containerd.io docker.io docker-engine docker-compose-plugin runc
 
     # 删除与 Docker 和 containerd 相关的文件和目录
     INFO "Cleaning up Docker and containerd directories"
@@ -1268,7 +1196,7 @@ system_uninstall_cri() {
     sudo systemctl daemon-reload
     sudo systemctl reset-failed
 
-    INFO "------------------------------------------------------"
+    INFO "----------------------------------------------------------"
     INFO "uninstall cri done"
     INFO "----------------------------------------------------------"
 }
@@ -3171,28 +3099,28 @@ while [ $# -gt 0 ]; do
         NOTE "================ set $2"
         eval "set_$2 $@"
         ;;
-    -si | --system-install)
+    -si | --si | --system-install)
         NOTE "================ system-install $2"
         eval "system_install_$2 $@"
         ;;
-    -sr | --system-uninstall)
+    -sr | --sr | --system-uninstall)
         NOTE "================ system-uninstall $2"
         eval "system_uninstall_$2 $@"
         ;;
-    -di | --docker-install)
+    -di | --di | --docker-install)
         NOTE "================ docker-install $2"
         eval "docker_install_$2 $@"
         ;;
-    -dr | --docker-uninstall)
+    -dr | --dr | --docker-uninstall)
         NOTE "================ docker-uninstall $2"
         eval "docker_uninstall_$2 $@"
         ;;
-    -ki | --k8s-install)
+    -ki | --ki | --k8s-install)
         NOTE "================ k8s-install $2"
         k8s_install_config
         eval "k8s_install_$2 $@"
         ;;
-    -kr | --k8s-uninstall)
+    -kr | --kr | --k8s-uninstall)
         NOTE "================ k8s-uninstall $2"
         k8s_install_config
         eval "k8s_uninstall_$2 $@"
