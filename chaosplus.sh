@@ -422,9 +422,11 @@ else
 fi
 INFO "ENV HAS_GOOGLE: ${HAS_GOOGLE:-"false"}"
 
-GHPROXY=${GHPROXY:-https://ghfast.top/}
+# GHPROXY=${GHPROXY:-https://ghfast.top/}
+GHPROXY=${GHPROXY}
 INFO "ENV GHPROXY: ${GHPROXY}"
-CRPROXY=${CRPROXY:-kubesre.xyz}
+# CRPROXY=${CRPROXY:-kubesre.xyz}
+CRPROXY=${CRPROXY}
 INFO "ENV CRPROXY: ${CRPROXY}"
 
 # https://github.com/labring-actions/cluster-image-docs/blob/main/docs/aliyun-shanghai/rootfs.md
@@ -1869,7 +1871,7 @@ docker_install_crproxy() {
 
 k8s_install_acme() {
     local namespace=$(getarg namespace $@)
-    local namespace=${namespace:-"default"}
+    local namespace=${namespace:-"https-manager"}
     local domain=$(getarg domain $@)
     local domain=${domain:-"${DOMAIN}"}
     local solver=$(getarg solver $@)
@@ -1886,6 +1888,8 @@ k8s_install_acme() {
     echo "ENV solver: ${solver}"
     echo "ENV secretId: ${secretId}"
     echo "ENV secretKey: ${secretKey}"
+
+    k8s_install_namespace --namespace $namespace
 
     if [ "$solver" == "dnspod" ] || [ "$solver" == "dns_dp" ]; then
         # https://imroc.cc/kubernetes/certs/sign-free-certs-for-dnspod
@@ -1960,7 +1964,7 @@ EOF
         echo "namesilo not support" && exit 1
     else
         ERROR "ENV solver: $solver is invalid, please use dnspod, ali, namesilo"
-        exit 1
+        return
     fi
 
     # 重启cert-manager-webhook-dnspod
@@ -2015,9 +2019,9 @@ k8s_install_nodeport() {
             echo "✅ 参数已存在，无需修改。"
             exit 0
         fi
-        \cp -rf "$MANIFEST_FILE" "$BACKUP_FILE"
+        #\cp -rf "$MANIFEST_FILE" "$BACKUP_FILE" || true
         # 如果有备份文件不会生效, 移走后生效
-        \mv -f "$BACKUP_FILE" ${TEMP}/
+        #\mv -f "$BACKUP_FILE" ${TEMP}/ || true
         echo "📦 备份原文件到 ${TEMP}/$(basename "$BACKUP_FILE")"
         echo "✏️ 清理旧的 node-port-range 参数整行..."
         sed -i '/--service-node-port-range=/d' "$MANIFEST_FILE"
@@ -2108,24 +2112,6 @@ k8s_install_openebs() {
     INFO "OpenEBS installed successfully."
 }
 
-k8s_install_istio() {
-    local profile=$(getarg profile $@)
-    if command -v sealos &>/dev/null 2>&1; then
-        local cluster=$(getarg cluster $@)
-        local cluster=${cluster:-"$CLUSTER"}
-        local latest_version=$(get_sealos_release_version istio)
-        sudo sealos run --cluster $cluster \
-            -f ${labring_image_registry}/${labring_image_repository}/istio:${latest_version} \
-            -e ISTIOCTL_OPTS="--set profile=${profile:-minimal} -y"
-        kubectl -n istio-system wait --for=condition=Ready pods --all
-        kubectl get gatewayclass
-        kubectl label namespace default istio-injection=enabled
-        # istioctl dashboard controlz deployment/istiod.istio-system
-        # kubectl get namespace -L istio-injection
-        # kubectl get all -n istio-system
-    fi
-}
-
 k8s_install_helm() {
     if ! command -v helm &>/dev/null; then
         if command -v sealos &>/dev/null; then
@@ -2168,11 +2154,11 @@ k8s_install_helm() {
 
     if command -v helm &>/dev/null; then
         helm version
-        helm repo add aliyun https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts >/dev/null || true
-        helm repo add kaiyuanshe http://mirror.kaiyuanshe.cn/kubernetes/charts >/dev/null || true
+        # helm repo add aliyun https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts >/dev/null || true
+        # helm repo add kaiyuanshe http://mirror.kaiyuanshe.cn/kubernetes/charts >/dev/null || true
         # helm repo add dandydev https://dandydeveloper.github.io/charts >/dev/null || true
         helm repo add azure http://mirror.azure.cn/kubernetes/charts >/dev/null || true
-        helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null || true
+        # helm repo add bitnami https://charts.bitnami.com/bitnami >/dev/null || true
     else
         ERROR "Helm installation failed."
         exit 1
@@ -2211,7 +2197,7 @@ spec:
   - cidr: "${addr}/32"
 EOF
     done
-    kubectl annotate svc higress-gateway -n higress-system --overwrite io.cilium/lb-ipam-ips=$IP_POOL 2>/dev/null || true
+    # kubectl annotate svc higress-gateway -n higress-system --overwrite io.cilium/lb-ipam-ips=$IP_POOL 2>/dev/null || true
 }
 
 k8s_install_cilium() {
@@ -2228,11 +2214,6 @@ k8s_install_cilium() {
 
     local kubeProxyReplacement=$(getarg kubeProxyReplacement $@)
     local kubeProxyReplacement=${kubeProxyReplacement:-"true"}
-
-    local ingress=$(getarg ingress $@)
-    local ingress=${ingress:-"false"}
-    local ingressHost=$(getarg ingress_host $@)
-    local ingressHost=${ingressHost:-"false"}
 
     local gatewayAPI=$(getarg gateway_api $@)
     local gatewayAPI=${gatewayAPI:-"false"}
@@ -2291,21 +2272,6 @@ k8s_install_cilium() {
             NOTE "Cilium Gateway API host enabled"
             local ExtraValues=$ExtraValues",gatewayAPI.hostNetwork.enabled=true"
             # local ExtraValues=$ExtraValues",gatewayAPI.externalTrafficPolicy=~"
-        fi
-    fi
-    if [ "${ingress}" = "true" ]; then
-        NOTE "Cilium Ingress enabled"
-        local ExtraValues=$ExtraValues",ingressController.enabled=${ingress}"
-        local ExtraValues=$ExtraValues",ingressController.loadbalancerMode=shared"
-
-        if [ "${ingressHost}" = "true" ]; then
-            NOTE "Cilium Ingress host enabled"
-            local ExtraValues=$ExtraValues",ingressController.hostNetwork.enabled=${ingressHost}"
-            local ExtraValues=$ExtraValues",ingressController.service.externalTrafficPolicy=~"
-        else
-            local ExtraValues=$ExtraValues",ingressController.service.type=LoadBalancer"
-            local ExtraValues=$ExtraValues",ingressController.service.insecureNodePort=80"
-            local ExtraValues=$ExtraValues",ingressController.service.secureNodePort=443"
         fi
     fi
     if [ "${envoy}" = "true" ]; then
@@ -2457,150 +2423,7 @@ k8s_uninstall_cilium() {
     kubectl delete daemonset,deployment,svc,cm,secret,clusterrole,clusterrolebinding,role,rolebinding,sa -l k8s-app=cilium -A
 }
 
-k8s_uninstall_higress() {
-    helm uninstall higress --namespace higress-system || true
-    hgctl uninstall --purge-resources || true
-}
 
-k8s_install_higress() {
-    local local=$(getarg local $@)
-    local host=$(getarg host $@)
-    local type=$(getarg type $@)
-    local istio=$(getarg istio $@)
-    local gateway=$(getarg gateway $@)
-    local ingress_class=$(getarg ingress_class $@)
-    local ingress_class=${ingress_class:-higress}
-
-    echo "local=${local}"
-    echo "host=${host}"
-    echo "type=${type}"
-    echo "istio=${istio}"
-    echo "gateway=${gateway}"
-
-    local VERSION=$(get_github_release_version "alibaba/higress")
-    echo "latest hgctl version: $VERSION"
-    curl -sfL ${GHPROXY}https://raw.githubusercontent.com/alibaba/higress/main/tools/hack/get-hgctl.sh |
-        sed "s|https://github.com|${GHPROXY}https://github.com|g" |
-        sed "s|downloadFile() {|downloadFile() {\nexport VERSION=${VERSION}|g" | bash
-
-    # if command -v hgctl &> /dev/null; then
-    #     echo y | hgctl install  \
-    #     --set profile=k8s \
-    #     --set global.enableIstioAPI=${gateway:-true} \
-    #     --set global.enableGatewayAPI=${istio:-true} \
-    #     --set charts.higress.url=https://higress.cn/helm-charts
-
-    if command -v helm &>/dev/null; then
-        helm repo add higress.io https://higress.cn/helm-charts
-        helm upgrade --install higress -n higress-system higress.io/higress \
-            --create-namespace \
-            --render-subchart-notes \
-            --set global.local=${local:-false} \
-            --set global.ingressClass="${ingress_class}" \
-            --set global.enableIstioAPI=${istio:-true} \
-            --set global.enableGatewayAPI=${gateway:-true} \
-            --set higress-core.gateway.replicas=1 \
-            --set higress-core.gateway.kind=DaemonSet \
-            --set higress-core.gateway.hostNetwork=${host:-false} \
-            --set higress-core.gateway.service.type=${type:-LoadBalancer} \
-            --set higress-core.gateway.resources.requests.cpu=256m \
-            --set higress-core.gateway.resources.requests.memory=128Mi \
-            --set higress-core.gateway.resources.limits.cpu=256m \
-            --set higress-core.gateway.resources.limits.memory=128Mi \
-            --set higress-core.controller.replicas=1 \
-            --set higress-core.controller.service.type=ClusterIP \
-            --set higress-core.controller.resources.requests.cpu=256m \
-            --set higress-core.controller.resources.requests.memory=128Mi \
-            --set higress-core.controller.resources.limits.cpu=256m \
-            --set higress-core.controller.resources.limits.memory=128Mi \
-            --set higress-core.pilot.replicaCount=1 \
-            --set higress-core.pilot.resources.limits.cpu=256m \
-            --set higress-core.pilot.resources.limits.memory=128Mi \
-            --set higress-core.pilot.resources.requests.cpu=256m \
-            --set higress-core.pilot.resources.requests.memory=128Mi \
-            --set higress.console.replicas=1 \
-            --set higress-console.service.type=NodePort \
-            --set higress-console.resources.requests.cpu=128m \
-            --set higress-console.resources.requests.memory=128Mi \
-            --set higress-console.certmanager.enabled=false
-        # --set higress-core.gateway.tolerations[0].key=node-role.kubernetes.io/control-plane \
-        # --set higress-core.gateway.tolerations[0].operator=Exists \
-        # --set higress-core.gateway.tolerations[0].effect=NoSchedule \
-        # --set "higress-core.controller.nodeSelector.node-role\.kubernetes\.io\/control-plane=" \
-        kubectl -n higress-system wait --for=condition=Ready pods --all
-        kubectl get po -n higress-system
-    elif command -v sealos &>/dev/null 2>&1; then
-        local cluster=$(getarg cluster $@)
-        local cluster=${cluster:-"$CLUSTER"}
-        local latest_version=$(get_sealos_release_version higress)
-        sudo sealos run --cluster $cluster \
-            -f ${labring_image_registry}/${labring_image_repository}/higress:${latest_version} \
-            -e HELM_OPTS=" \
-    --set global.local=${local:-false} \
-    --set global.ingressClass=higress \
-    --set global.enableIstioAPI=${istio:-true} \
-    --set global.enableGatewayAPI=${gateway:-true} \
-    --set higress-core.gateway.replicas=1 \
-    --set higress-core.gateway.hostNetwork=${host:-false} \
-    --set higress-core.gateway.service.type=${type:-LoadBalancer} \
-    --set higress-core.gateway.resources.requests.cpu=256m \
-    --set higress-core.gateway.resources.requests.memory=128Mi \
-    --set higress-core.gateway.resources.limits.cpu=256m \
-    --set higress-core.gateway.resources.limits.memory=128Mi \
-    --set higress-core.controller.replicas=1 \
-    --set higress-core.controller.service.type=ClusterIP \
-    --set higress-core.controller.resources.requests.cpu=256m \
-    --set higress-core.controller.resources.requests.memory=128Mi \
-    --set higress-core.controller.resources.limits.cpu=256m \
-    --set higress-core.controller.resources.limits.memory=128Mi \
-    --set higress-core.pilot.replicaCount=1 \
-    --set higress-core.pilot.resources.limits.cpu=256m \
-    --set higress-core.pilot.resources.limits.memory=128Mi \
-    --set higress-core.pilot.resources.requests.cpu=256m \
-    --set higress-core.pilot.resources.requests.memory=128Mi \
-    --set higress.console.replicas=1 \
-    --set higress-console.service.type=NodePort \
-    --set higress-console.resources.requests.cpu=128m \
-    --set higress-console.resources.requests.memory=128Mi \
-    --set higress-console.certmanager.enabled=false \
-    "
-        kubectl -n higress-system wait --for=condition=Ready pods --all
-        kubectl get po -n higress-system
-        # kubectl port-forward service/higress-gateway -n higress-system 80:80 443:443
-    fi
-
-}
-
-k8s_install_higress_console() {
-    if command -v hgctl &>/dev/null; then
-        hgctl dashboard
-    else
-        ERROR "higress console installation failed."
-    fi
-}
-
-k8s_install_ingress_nginx() {
-    local host=$(getarg host $@)
-    if command -v sealos &>/dev/null 2>&1; then
-        local cluster=$(getarg cluster $@)
-        local cluster=${cluster:-"$CLUSTER"}
-        local latest_version=$(get_sealos_release_version ingress-nginx)
-        sudo sealos run --cluster $cluster \
-            -f ${labring_image_registry}/${labring_image_repository}/ingress-nginx:${latest_version} \
-            -e HELM_OPTS="--set controller.hostNetwork=${host:-true} --set controller.kind=DaemonSet --set controller.service.type=NodePort"
-        # 使用宿主机网络, DaemonSet保证每个节点都可以接管流量, 使用NodePort暴露端口
-        # 至此可以应用可以使用 ingressClass=ingress 暴露服务; 值得注意的是, 如果服务不可用,可能LoadBalancer不会分配ExternalIP
-    elif command -v helm &>/dev/null; then
-        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-        helm repo update
-        helm upgrade --install nginx-ingress ingress-nginx/ingress-nginx \
-            --namespace ingress-nginx \
-            --create-namespace \
-            --set controller.hostNetwork=${host:-true} \
-            --set controller.kind=DaemonSet \
-            --set controller.service.type=NodePort
-    fi
-}
 
 k8s_install_kube_state_metrics() {
     if command -v sealos &>/dev/null 2>&1; then
@@ -2658,12 +2481,6 @@ k8s_install_core() {
 
     # k8s_install_longhorn $@
 
-    # k8s_install_ingress_nginx $@
-
-    k8s_install_higress $@
-
-    # k8s_install_higress_console $@
-
 }
 
 k8s_install_namespace() {
@@ -2672,7 +2489,9 @@ k8s_install_namespace() {
         ERROR "namespace is required"
         return 1
     fi
-    kubectl create namespace ${namespace}
+    if ! kubectl get namespace ${namespace} &>/dev/null; then
+        kubectl create namespace ${namespace}
+    fi
 }
 
 k8s_install_gateway() {
@@ -2681,6 +2500,7 @@ k8s_install_gateway() {
     local name=$(echo ${name} | tr '.' '-')
     local name=${name:-wildcard-$(echo ${domain} | tr '.' '-')-gateway}
     local namespace=$(getarg namespace $@)
+    local namespace=${namespace:-https-manager}
 
     if [ -z "${domain}" ]; then
         ERROR "domain is required"
@@ -2692,7 +2512,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: ${name}
-  namespace: ${namespace:-default}
+  namespace: ${namespace}
 spec:
   gatewayClassName: cilium
   listeners:
@@ -2739,11 +2559,11 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: ${name}-redirect-to-https
-  namespace: ${namespace:-default}
+  namespace: ${namespace}
 spec:
   parentRefs:
     - name: ${name}
-      namespace: ${namespace:-default}
+      namespace: ${namespace}
       sectionName: http-root-${domain}
   hostnames:
     - "${domain}"
@@ -2764,36 +2584,33 @@ EOF
 
 }
 
-# https://kubernetes.github.io/ingress-nginx/examples/auth/basic/
 k8s_install_route() {
     local name=$(getarg name $@)
     local namespace=$(getarg namespace $@)
+    local route_namespace=$(getarg route_namespace $@)
+    local route_namespace=${route_namespace:-https-manager}
     local service_name=$(getarg service_name $@)
     local service_port=$(getarg service_port $@)
+    local service_namespace=$(getarg service_namespace $@)
+    local service_namespace=${service_namespace:-${namespace}}
 
     local routes=$(getarg routes $@)
-    local routes=${routes:-${name}.localhost}
     local routes=$(echo ${routes[@]} | tr ',' ' ')
     local path_type=$(getarg path_type $@)
     local tlsSecret=$(getarg tls_secret $@)
-    local sslRedirect=$(getarg ssl_redirect $@)
 
-    local ingress_mode=$(getarg ingress_mode $@)
-    local ingress_class=$(getarg ingress_class $@)
-    local ingress_classes=$(kubectl get ingressclasses -o jsonpath='{.items[*].metadata.name}')
-    if [ "$ingress_mode" == "" ] && [ -n "$ingress_classes" ]; then
-        local ingress_mode="true"
+    if [ -z "${routes}" ]; then
+        WARNING "routes is required"
+        return
     fi
-    if [ "$ingress_mode" == "true" ] && [ "$ingress_class" == "" ] && [ -n "$ingress_classes" ]; then
-        local ingress_class=$(echo "$ingress_classes" | awk '{print $1}')
-    fi
+
 
     # https://github.com/kubernetes-sigs/gateway-api/blob/master/examples/gatewayclass.yaml
     local gateway=$(getarg gateway $@)
-    local gateway_mode=$(getarg gateway_mode $@)
     local gateway_classes=$(kubectl get gatewayclasses.gateway.networking.k8s.io -A --no-headers | awk '{print $1 " " $2}')
-    if [ "$gateway_mode" == "" ] && [ -n "${gateway_classes}" ]; then
-        local gateway_mode="true"
+    if [ ! -n "${gateway_classes}" ]; then
+        ERROR "Gateway class is not found"
+        return
     fi
 
     NOTE ">>> install routing rules for routes: ${routes}"
@@ -2802,19 +2619,18 @@ k8s_install_route() {
         local domain=$(echo "$route" | awk -F. '{print $(NF-1)"."$NF}')
         local idx=$(expr $idx + 1)
         echo "--------------------------------------------------------------------------"
-        echo "Creating route for: ${route} (gateway_mode=${gateway_mode})"
-        if [ "${gateway_mode}" == "true" ]; then
-            # ---------------------- Gateway API 模式 --------------------------
-            cat <<EOF | kubectl apply -f -
+        echo "Creating route for: ${route}"
+        # ---------------------- Gateway API 模式 --------------------------
+        cat <<EOF | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: ${name}${idx}
-  namespace: ${namespace:-default}
+  namespace: ${route_namespace}
 spec:
   parentRefs:
   - name: ${gateway:-wildcard-$(echo ${domain} | tr '.' '-')-gateway}
-    namespace: ${namespace:-default}
+    namespace: ${route_namespace}
   hostnames:
   - ${route}
   rules:
@@ -2824,50 +2640,25 @@ spec:
         value: /
     backendRefs:
     - name: ${service_name:-${name}}
+      namespace: ${service_namespace}
       port: ${service_port:-80}
 EOF
 
-        elif [ "${ingress_mode}" == "true" ]; then
-            # ---------------------- Ingress 模式 --------------------------
-
-            local annotations=""
-            if [ -n "$tlsSecret" ]; then
-                annotations="nginx.ingress.kubernetes.io/backend-protocol: 'HTTP'
-    nginx.ingress.kubernetes.io/proxy-ssl-name: '${domain}'
-    nginx.ingress.kubernetes.io/proxy-ssl-server-name: 'true'
-    nginx.ingress.kubernetes.io/ssl-redirect: '${sslRedirect:-false}'"
-                local tls="tls:
-  - hosts:
-    - \"${route}\"
-    secretName: ${tlsSecret:-wildcard-${domain}-tls}"
-            fi
-
-            cat <<EOF | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+        cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
 metadata:
-  name: ${name}${idx}
-  namespace: ${namespace:-default}
-  annotations:
-    kubernetes.io/ingress.class: ${ingress_class:-nginx}
-    ${annotations}
+  name: allow-${route_namespace}-to-${namespace}
+  namespace: ${namespace}
 spec:
-  ingressClassName: ${ingress_class:-nginx}
-  rules:
-  - host: ${route}
-    http:
-      paths:
-      - path: "/"
-        pathType: ${path_type:-ImplementationSpecific}
-        backend:
-          service:
-            name: ${service_name:-${name}}
-            port:
-              number: ${service_port:-80}
-  ${tls}
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: ${route_namespace}
+  to:
+  - group: ""
+    kind: Service
 EOF
-
-        fi
     done
 }
 
@@ -2876,6 +2667,52 @@ EOF
 # k8s app
 #
 ###################################################################################################
+
+k8s_uninstall_kube_prometheus_stack() {
+    local namespace=$(getarg namespace $@ 2>/dev/null)
+    local namespace=${namespace:-monitoring}
+    helm uninstall monitor-stack -n $namespace
+}
+
+k8s_install_kube_prometheus_stack() {
+
+    local namespace=$(getarg namespace $@ 2>/dev/null)
+    local namespace=${namespace:-monitoring}
+
+    if command -v helm &>/dev/null; then
+        if [ ! -n "$(kubectl get ns $namespace 2>/dev/null)" ]; then
+            kubectl create ns $namespace
+        fi
+        if kubectl get pods -n $namespace 2>/dev/null | grep monitor-stack; then
+            echo "k8s-prometheus-stack already installed, skip"
+        else
+            helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+            # helm repo update
+            helm install monitor-stack prometheus-community/kube-prometheus-stack \
+            --namespace $namespace --create-namespace 
+        fi
+    fi
+
+
+    local grafana_routes=$(getarg grafana_routes $@)
+
+    local tls_secret=$(getarg tls_secret $@)
+
+    local srv_name=$(kubectl get service -n ${namespace} | grep monitor-stack-grafana | awk '{print $1}')
+
+    k8s_install_route \
+        --name monitor-stack-grafana \
+        --namespace ${namespace} \
+        --service_name $srv_name \
+        --service_port 80 \
+        --routes ${grafana_routes} \
+        --tls_secret ${tls_secret}
+
+    kubectl -n $namespace wait --for=condition=Ready pods --all || true
+
+    local admin_password=$(kubectl get secret -n $namespace monitor-stack-grafana -o jsonpath="{.data.admin-password}" | base64 --decode)
+    INFO "ENV GRAFANA_ADMIN_PASSWORD: ${admin_password}"
+}
 
 k8s_install_frps() {
 
@@ -2887,10 +2724,11 @@ k8s_install_frps() {
 
     local namespace=$(getarg namespace $@ 2>/dev/null)
     local namespace=${namespace:-frp-system}
+
+    k8s_install_namespace --namespace ${namespace}
+
     local storage_class=$(getarg storage_class $@ 2>/dev/null)
     local storage_class=${storage_class:-""}
-
-    local ingress_class=$(getarg ingress_class $@ 2>/dev/null)
 
     local service_type=$(getarg service_type $@ 2>/dev/null)
     local service_type=${service_type:-NodePort}
@@ -2898,7 +2736,6 @@ k8s_install_frps() {
     local image=$(getarg image $@ 2>/dev/null)
     local image=${image:-docker.io/snowdreamtech/frps}
 
-    kubectl create namespace $namespace 2>/dev/null || true
 
     local token=$(getarg token $@)
     local token=${token:-${TOKEN}}
@@ -3022,16 +2859,12 @@ spec:
 " | kubectl apply -f -
 
     local bind_routes=$(getarg bind_routes $@)
-    local bind_routes=${bind_routes:-'frps.localhost'}
 
     local dashboard_routes=$(getarg dashboard_routes $@)
-    local dashboard_routes=${dashboard_routes:-'frps-ui.localhost'}
 
     local http_routes=$(getarg http_routes $@)
-    local http_routes=${http_routes:-'frp-http.localhost'}
 
     local tcp_routes=$(getarg tcp_routes $@)
-    local tcp_routes=${tcp_routes:-'frp-tcp.localhost'}
 
     local tls_secret=$(getarg tls_secret $@)
 
@@ -3040,7 +2873,6 @@ spec:
     k8s_install_route \
         --name frps-bind \
         --namespace ${namespace} \
-        --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_bind \
         --routes ${bind_routes} \
@@ -3049,7 +2881,6 @@ spec:
     k8s_install_route \
         --name frps-ui \
         --namespace ${namespace} \
-        --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_ui \
         --routes ${dashboard_routes} \
@@ -3058,7 +2889,6 @@ spec:
     k8s_install_route \
         --name frps-http \
         --namespace ${namespace} \
-        --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_http \
         --routes ${http_routes} \
@@ -3067,7 +2897,6 @@ spec:
     k8s_install_route \
         --name frps-tcp \
         --namespace ${namespace} \
-        --ingress_class ${ingress_class} \
         --service_name $srv_name \
         --service_port $port_tcp \
         --routes ${tcp_routes} \
