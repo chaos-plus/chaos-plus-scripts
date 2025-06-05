@@ -1,6 +1,12 @@
 # Chaos Plus Scripts
 
 > native, docker, k8s
+
+## Install crproxy for chinese user
+
+> [https://github.com/chaos-plus/chaos-plus-proxy-scripts](https://github.com/chaos-plus/chaos-plus-proxy-scripts)
+
+
 ## Env Setup
 
 ```bash
@@ -50,10 +56,6 @@ echo "ENV SSHPWD: ${SSHPWD}"
 echo "--------------------------------------------------"
 
 ```
-
-## Install crproxy for chinese user
-
-> [https://github.com/chaos-plus/chaos-plus-proxy-scripts](https://github.com/chaos-plus/chaos-plus-proxy-scripts)
 
 
 ## Uninstall K8S
