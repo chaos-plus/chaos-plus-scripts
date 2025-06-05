@@ -1,15 +1,10 @@
 # Chaos Plus Scripts
 
 > native, docker, k8s
-
-## Install crproxy for chinese user
-
-> [https://github.com/chaos-plus/chaos-plus-proxy-scripts](https://github.com/chaos-plus/chaos-plus-proxy-scripts)
-
-
-## Install K&S
+## Env Setup
 
 ```bash
+#!/bin/sh -e
 
 if [ ! -n "$IPV4_WAN" ]; then
    export IPV4_WAN=$(curl -sfL ifconfig.me --silent --connect-timeout 5 --max-time 5)
@@ -37,10 +32,10 @@ export GHPROXY=https://gh.noproxy.top/
 
 export DOMAIN="example.com"
 export ACME_DNS="dnspod"
-export ACME_DNS_ID="your tencent ram id"
-export ACME_DNS_KEY="your tencent ram key"
+export ACME_DNS_ID="xxxx"
+export ACME_DNS_KEY="****"
 
-export SSHPWD="ssh password"
+export SSHPWD="xxxx"
 
 echo "--------------------------------------------------"
 echo "ENV IPV4_WAN: ${IPV4_WAN}"
@@ -51,13 +46,36 @@ echo "ENV DOMAIN: ${DOMAIN}"
 echo "ENV ACME_DNS: ${ACME_DNS}"
 echo "ENV ACME_DNS_ID: ${ACME_DNS_ID}"
 echo "ENV ACME_DNS_KEY: ${ACME_DNS_KEY}"
+echo "ENV SSHPWD: ${SSHPWD}"
 echo "--------------------------------------------------"
+
+```
+
+## Install crproxy for chinese user
+
+> [https://github.com/chaos-plus/chaos-plus-proxy-scripts](https://github.com/chaos-plus/chaos-plus-proxy-scripts)
+
+
+## Uninstall K8S
+
+```bash
+bash chaosplus.sh \
+-sr k8s_auto \
+-sr cri \
+--sshpwd ${SSHPWD}
+```
+
+
+## Install K&S
+
+```bash
 
 bash chaosplus.sh --set linux_mirrors_auto
 
 bash chaosplus.sh --init
 
 mkdir -p /etc/containerd/certs.d
+
 bash chaosplus.sh \
 -set cr_mirrors_auto \
 --schema https \
@@ -84,16 +102,12 @@ bash chaosplus.sh -ki helm
 # bash chaosplus.sh -kr gateway_api --version v1.2.0
 bash chaosplus.sh -ki gateway_api --version v1.2.0
 
-# 1.16.1 1.17.0 1.17.4
+# 1.16.1  1.17.4
 # bash chaosplus.sh -kr cilium
 bash chaosplus.sh -ki cilium --cilium_version 1.17.0 \
 --gateway_api true \
 --gateway_host true
 # bash chaosplus.sh -ki cilium --upgrade --cilium_version 1.17.0
-# 配置 Gateway 时，Cilium 会创建一个类型为 LoadBalancer 的 Service, 需要配置cidr, 否则 gateway 会 programed unknown
-# bash chaosplus.sh -ki cilium_cidr --cidr ${IPV4_WAN}
-
-# bash chaosplus.sh -ki istio
 
 bash chaosplus.sh -ki cert_manager
 
@@ -101,22 +115,20 @@ bash chaosplus.sh -ki metrics_server
 
 bash chaosplus.sh -ki openebs
 
-bash chaosplus.sh -ki namespace \
---namespace cloud
-
 bash chaosplus.sh -ki acme \
---namespace cloud \
---domain ${DOMAIN} \
 --solver ${ACME_DNS} \
 --secret_id ${ACME_DNS_ID} \
 --secret_key ${ACME_DNS_KEY}
 
 bash chaosplus.sh -ki gateway \
---namespace cloud \
 --domain ${DOMAIN}
 
+# bash chaosplus.sh -kr kube_prometheus_stack
+bash chaosplus.sh -ki kube_prometheus_stack \
+--grafana_routes "grafana.${DOMAIN}" \
+--tls_secret "${DOMAIN}-crt"
+
 bash chaosplus.sh -ki frps \
---namespace cloud \
 --bind_routes "frps.${DOMAIN}" \
 --dashboard_routes "frps-ui.${DOMAIN}" \
 --http_routes "frp-http.${DOMAIN}" \
@@ -125,11 +137,3 @@ bash chaosplus.sh -ki frps \
 
 ```
 
-## Uninstall K8S
-
-```bash
-bash chaosplus.sh \
--sr k8s_auto \
--sr cri \
---sshpwd ${SSHPWD}
-```
